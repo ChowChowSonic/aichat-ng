@@ -2,7 +2,7 @@ use super::*;
 
 use crate::utils::strip_think_tag;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -77,37 +77,12 @@ pub async fn claude_chat_completions_streaming(
     handler: &mut SseHandler,
     _model: &Model,
 ) -> Result<()> {
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
     let mut reasoning_state = 0;
     let handle = |message: SseMmessage| -> Result<bool> {
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
         if let Some(typ) = data["type"].as_str() {
             match typ {
-                "content_block_start" => {
-                    if let (Some("tool_use"), Some(name), Some(id)) = (
-                        data["content_block"]["type"].as_str(),
-                        data["content_block"]["name"].as_str(),
-                        data["content_block"]["id"].as_str(),
-                    ) {
-                        if !function_name.is_empty() {
-                            let arguments: Value =
-                                function_arguments.parse().with_context(|| {
-                                    format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                                })?;
-                            handler.tool_call(ToolCall::new(
-                                function_name.clone(),
-                                arguments,
-                                Some(function_id.clone()),
-                            ))?;
-                        }
-                        function_name = name.into();
-                        function_arguments.clear();
-                        function_id = id.into();
-                    }
-                }
                 "content_block_delta" => {
                     if let Some(text) = data["delta"]["text"].as_str() {
                         handler.text(text)?;
@@ -117,31 +92,12 @@ pub async fn claude_chat_completions_streaming(
                             reasoning_state = 1;
                         }
                         handler.text(text)?;
-                    } else if let (true, Some(partial_json)) = (
-                        !function_name.is_empty(),
-                        data["delta"]["partial_json"].as_str(),
-                    ) {
-                        function_arguments.push_str(partial_json);
                     }
                 }
                 "content_block_stop" => {
                     if reasoning_state == 1 {
                         handler.text("\n</think>\n\n")?;
                         reasoning_state = 0;
-                    }
-                    if !function_name.is_empty() {
-                        let arguments: Value = if function_arguments.is_empty() {
-                            json!({})
-                        } else {
-                            function_arguments.parse().with_context(|| {
-                                format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                            })?
-                        };
-                        handler.tool_call(ToolCall::new(
-                            function_name.clone(),
-                            arguments,
-                            Some(function_id.clone()),
-                        ))?;
                     }
                 }
                 _ => {}
@@ -161,8 +117,8 @@ pub fn claude_build_chat_completions_body(
         mut messages,
         temperature,
         top_p,
-        functions,
         stream,
+        tools: _,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -173,16 +129,21 @@ pub fn claude_build_chat_completions_body(
     let messages: Vec<Value> = messages
         .into_iter()
         .enumerate()
-        .flat_map(|(i, message)| {
-            let Message { role, content } = message;
+        .map(|(i, message)| {
+            let Message {
+                role,
+                content,
+                tool_call_id: _,
+                tool_calls: _,
+            } = message;
             match content {
                 MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {
-                    vec![json!({ "role": role, "content": strip_think_tag(&text) })]
+                    json!({ "role": role, "content": strip_think_tag(&text) })
                 }
-                MessageContent::Text(text) => vec![json!({
+                MessageContent::Text(text) => json!({
                     "role": role,
                     "content": text,
-                })],
+                }),
                 MessageContent::Array(list) => {
                     let content: Vec<_> = list
                         .into_iter()
@@ -212,45 +173,10 @@ pub fn claude_build_chat_completions_body(
                             }
                         })
                         .collect();
-                    vec![json!({
+                    json!({
                         "role": role,
                         "content": content,
-                    })]
-                }
-                MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results, text, ..
-                }) => {
-                    let mut assistant_parts = vec![];
-                    let mut user_parts = vec![];
-                    if !text.is_empty() {
-                        assistant_parts.push(json!({
-                            "type": "text",
-                            "text": text,
-                        }))
-                    }
-                    for tool_result in tool_results {
-                        assistant_parts.push(json!({
-                            "type": "tool_use",
-                            "id": tool_result.call.id,
-                            "name": tool_result.call.name,
-                            "input": tool_result.call.arguments,
-                        }));
-                        user_parts.push(json!({
-                            "type": "tool_result",
-                            "tool_use_id": tool_result.call.id,
-                            "content": tool_result.output.to_string(),
-                        }));
-                    }
-                    vec![
-                        json!({
-                            "role": "assistant",
-                            "content": assistant_parts,
-                        }),
-                        json!({
-                            "role": "user",
-                            "content": user_parts,
-                        }),
-                    ]
+                    })
                 }
             }
         })
@@ -282,25 +208,12 @@ pub fn claude_build_chat_completions_body(
     if stream {
         body["stream"] = true.into();
     }
-    if let Some(functions) = functions {
-        body["tools"] = functions
-            .iter()
-            .map(|v| {
-                json!({
-                    "name": v.name,
-                    "description": v.description,
-                    "input_schema": v.parameters,
-                })
-            })
-            .collect();
-    }
     Ok(body)
 }
 
 pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     let mut text = String::new();
     let mut reasoning = None;
-    let mut tool_calls = vec![];
     if let Some(list) = data["content"].as_array() {
         for item in list {
             match item["type"].as_str() {
@@ -317,19 +230,6 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
                         text.push_str(v);
                     }
                 }
-                Some("tool_use") => {
-                    if let (Some(name), Some(input), Some(id)) = (
-                        item["name"].as_str(),
-                        item.get("input"),
-                        item["id"].as_str(),
-                    ) {
-                        tool_calls.push(ToolCall::new(
-                            name.to_string(),
-                            input.clone(),
-                            Some(id.to_string()),
-                        ));
-                    }
-                }
                 _ => {}
             }
         }
@@ -338,16 +238,16 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         text = format!("<think>\n{reasoning}\n</think>\n\n{text}")
     }
 
-    if text.is_empty() && tool_calls.is_empty() {
+    if text.is_empty() {
         bail!("Invalid response data: {data}");
     }
 
     let output = ChatCompletionsOutput {
         text: text.to_string(),
-        tool_calls,
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["input_tokens"].as_u64(),
         output_tokens: data["usage"]["output_tokens"].as_u64(),
+        tool_calls: None,
     };
     Ok(output)
 }

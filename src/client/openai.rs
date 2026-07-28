@@ -1,11 +1,12 @@
 use super::*;
 
-use crate::utils::strip_think_tag;
+use crate::utils::{strip_think_tag, strip_tool_call_tag};
 
 use anyhow::{bail, Context, Result};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 const API_BASE: &str = "https://api.openai.com/v1";
 
@@ -97,36 +98,32 @@ pub async fn openai_chat_completions(
     openai_extract_chat_completions(&data)
 }
 
+struct ToolCallAccum {
+    id: Option<String>,
+    type_: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
 pub async fn openai_chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
     _model: &Model,
 ) -> Result<()> {
-    let mut call_id = String::new();
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
     let mut reasoning_state = 0;
+    let mut tool_accums: BTreeMap<usize, ToolCallAccum> = BTreeMap::new();
+    let mut tool_calls_detected = false;
+
     let handle = |message: SseMmessage| -> Result<bool> {
         if message.data == "[DONE]" {
-            if !function_name.is_empty() {
-                if function_arguments.is_empty() {
-                    function_arguments = String::from("{}");
-                }
-                let arguments: Value = function_arguments.parse().with_context(|| {
-                    format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                })?;
-                handler.tool_call(ToolCall::new(
-                    function_name.clone(),
-                    arguments,
-                    normalize_function_id(&function_id),
-                ))?;
-            }
             return Ok(true);
         }
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
-        if let Some(text) = data["choices"][0]["delta"]["content"]
+        let choice = &data["choices"][0];
+        let delta = &choice["delta"];
+
+        if let Some(text) = delta["content"]
             .as_str()
             .filter(|v| !v.is_empty())
         {
@@ -135,9 +132,9 @@ pub async fn openai_chat_completions_streaming(
                 reasoning_state = 0;
             }
             handler.text(text)?;
-        } else if let Some(text) = data["choices"][0]["delta"]["reasoning_content"]
+        } else if let Some(text) = delta["reasoning_content"]
             .as_str()
-            .or_else(|| data["choices"][0]["delta"]["reasoning"].as_str())
+            .or_else(|| delta["reasoning"].as_str())
             .filter(|v| !v.is_empty())
         {
             if reasoning_state == 0 {
@@ -146,51 +143,52 @@ pub async fn openai_chat_completions_streaming(
             }
             handler.text(text)?;
         }
-        if let (Some(function), index, id) = (
-            data["choices"][0]["delta"]["tool_calls"][0]["function"].as_object(),
-            data["choices"][0]["delta"]["tool_calls"][0]["index"].as_u64(),
-            data["choices"][0]["delta"]["tool_calls"][0]["id"]
-                .as_str()
-                .filter(|v| !v.is_empty()),
-        ) {
-            if reasoning_state == 1 {
-                handler.text("\n</think>\n\n")?;
-                reasoning_state = 0;
-            }
-            let maybe_call_id = format!("{}/{}", id.unwrap_or_default(), index.unwrap_or_default());
-            if maybe_call_id != call_id && maybe_call_id.len() >= call_id.len() {
-                if !function_name.is_empty() {
-                    if function_arguments.is_empty() {
-                        function_arguments = String::from("{}");
-                    }
-                    let arguments: Value = function_arguments.parse().with_context(|| {
-                        format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                    })?;
-                    handler.tool_call(ToolCall::new(
-                        function_name.clone(),
-                        arguments,
-                        normalize_function_id(&function_id),
-                    ))?;
+
+        if let Some(tool_calls) = delta["tool_calls"].as_array() {
+            tool_calls_detected = true;
+            for tc_delta in tool_calls {
+                let index = tc_delta["index"].as_u64().unwrap_or(0) as usize;
+                let accum = tool_accums.entry(index).or_insert(ToolCallAccum {
+                    id: None,
+                    type_: None,
+                    name: None,
+                    arguments: String::new(),
+                });
+                if let Some(id) = tc_delta["id"].as_str() {
+                    accum.id = Some(id.to_string());
                 }
-                function_name.clear();
-                function_arguments.clear();
-                function_id.clear();
-                call_id = maybe_call_id;
-            }
-            if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
-                if name.starts_with(&function_name) {
-                    function_name = name.to_string();
-                } else {
-                    function_name.push_str(name);
+                if let Some(type_) = tc_delta["type"].as_str() {
+                    accum.type_ = Some(type_.to_string());
                 }
-            }
-            if let Some(arguments) = function.get("arguments").and_then(|v| v.as_str()) {
-                function_arguments.push_str(arguments);
-            }
-            if let Some(id) = id {
-                function_id = id.to_string();
+                if let Some(name) = tc_delta["function"]["name"].as_str() {
+                    accum.name = Some(name.to_string());
+                }
+                if let Some(args) = tc_delta["function"]["arguments"].as_str() {
+                    accum.arguments.push_str(args);
+                }
             }
         }
+
+        if let Some(finish_reason) = choice["finish_reason"].as_str() {
+            if finish_reason == "tool_calls" && tool_calls_detected {
+                let calls: Vec<ToolCall> = tool_accums
+                    .values()
+                    .map(|accum| ToolCall {
+                        id: accum.id.clone().unwrap_or_default(),
+                        type_: accum.type_.clone().unwrap_or_else(|| "function".into()),
+                        function: ToolCallFunction {
+                            name: accum.name.clone().unwrap_or_default(),
+                            arguments: accum.arguments.clone(),
+                        },
+                    })
+                    .collect();
+                if !calls.is_empty() {
+                    handler.set_tool_calls(calls);
+                    return Ok(true);
+                }
+            }
+        }
+
         Ok(false)
     };
 
@@ -228,79 +226,51 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
         messages,
         temperature,
         top_p,
-        functions,
         stream,
+        tools,
     } = data;
 
     let messages_len = messages.len();
     let messages: Vec<Value> = messages
         .into_iter()
         .enumerate()
-        .flat_map(|(i, message)| {
-            let Message { role, content } = message;
-            match content {
-                MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results,
-                    text: _,
-                    sequence,
-                }) => {
-                    if !sequence {
-                        let tool_calls: Vec<_> = tool_results
-                            .iter()
-                            .map(|tool_result| {
-                                json!({
-                                    "id": tool_result.call.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tool_result.call.name,
-                                        "arguments": tool_result.call.arguments.to_string(),
-                                    },
-                                })
-                            })
-                            .collect();
-                        let mut messages = vec![
-                            json!({ "role": MessageRole::Assistant, "tool_calls": tool_calls }),
-                        ];
-                        for tool_result in tool_results {
-                            messages.push(json!({
-                                "role": "tool",
-                                "content": tool_result.output.to_string(),
-                                "tool_call_id": tool_result.call.id,
-                            }));
-                        }
-                        messages
+        .map(|(i, message)| {
+            let Message {
+                role,
+                content,
+                tool_call_id,
+                tool_calls,
+            } = message;
+            let mut obj = json!({ "role": role });
+            let content_val = match &content {
+                MessageContent::Text(text) if role.is_assistant() => {
+                    let text = strip_tool_call_tag(text);
+                    if i != messages_len - 1 {
+                        Value::String(strip_think_tag(&text).to_string())
                     } else {
-                        tool_results.into_iter().flat_map(|tool_result| {
-                            vec![
-                                json!({
-                                    "role": MessageRole::Assistant,
-                                    "tool_calls": [
-                                        {
-                                            "id": tool_result.call.id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": tool_result.call.name,
-                                                "arguments": tool_result.call.arguments.to_string(),
-                                            },
-                                        }
-                                    ]
-                                }),
-                                json!({
-                                    "role": "tool",
-                                    "content": tool_result.output.to_string(),
-                                    "tool_call_id": tool_result.call.id,
-                                })
-                            ]
-
-                        }).collect()
+                        Value::String(text.to_string())
                     }
                 }
-                MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {
-                    vec![json!({ "role": role, "content": strip_think_tag(&text) }
-                    )]
+                _ => json!(&content),
+            };
+            obj["content"] = content_val;
+            if role.is_tool() {
+                if let Some(tcid) = tool_call_id {
+                    obj["tool_call_id"] = Value::String(tcid);
                 }
-                _ => vec![json!({ "role": role, "content": content })],
+                if let MessageContent::Text(t) = &content {
+                    obj["content"] = Value::String(t.clone());
+                }
             }
+            if role.is_assistant() {
+                if let Some(tc) = tool_calls {
+                    obj["tool_calls"] = json!(tc);
+                }
+            }
+            if obj["content"] == Value::Null {
+                obj["content"] = Value::String(String::new());
+            }
+            obj
         })
         .collect();
 
@@ -308,6 +278,12 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
         "model": &model.real_name(),
         "messages": messages,
     });
+
+    if let Some(tools) = tools {
+        if !tools.is_empty() {
+            body["tools"] = json!(tools);
+        }
+    }
 
     if let Some(v) = model.max_tokens_param() {
         if model
@@ -328,17 +304,6 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
     }
     if stream {
         body["stream"] = true.into();
-    }
-    if let Some(functions) = functions {
-        body["tools"] = functions
-            .iter()
-            .map(|v| {
-                json!({
-                    "type": "function",
-                    "function": v,
-                })
-            })
-            .collect();
     }
     body
 }
@@ -361,27 +326,10 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         .unwrap_or_default()
         .trim();
 
-    let mut tool_calls = vec![];
-    if let Some(calls) = data["choices"][0]["message"]["tool_calls"].as_array() {
-        for call in calls {
-            if let (Some(name), Some(arguments), Some(id)) = (
-                call["function"]["name"].as_str(),
-                call["function"]["arguments"].as_str(),
-                call["id"].as_str(),
-            ) {
-                let arguments: Value = arguments.parse().with_context(|| {
-                    format!("Tool call '{name}' have non-JSON arguments '{arguments}'")
-                })?;
-                tool_calls.push(ToolCall::new(
-                    name.to_string(),
-                    arguments,
-                    Some(id.to_string()),
-                ));
-            }
-        }
-    };
+    let tool_calls: Option<Vec<ToolCall>> =
+        serde_json::from_value(data["choices"][0]["message"]["tool_calls"].clone()).ok();
 
-    if text.is_empty() && tool_calls.is_empty() {
+    if text.is_empty() && reasoning.is_empty() && tool_calls.is_none() {
         bail!("Invalid response data: {data}");
     }
     let text = if !reasoning.is_empty() {
@@ -391,18 +339,10 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     };
     let output = ChatCompletionsOutput {
         text,
-        tool_calls,
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["prompt_tokens"].as_u64(),
         output_tokens: data["usage"]["completion_tokens"].as_u64(),
+        tool_calls,
     };
     Ok(output)
-}
-
-fn normalize_function_id(value: &str) -> Option<String> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
 }

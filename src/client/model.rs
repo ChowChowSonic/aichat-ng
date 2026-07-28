@@ -1,7 +1,7 @@
 use super::{
     list_all_models, list_client_names,
     message::{Message, MessageContent, MessageContentPart},
-    ApiPatch, MessageContentToolCalls, RequestPatch,
+    ApiPatch, RequestPatch,
 };
 
 use crate::config::Config;
@@ -135,7 +135,6 @@ impl Model {
                     input_price,
                     output_price,
                     supports_vision,
-                    supports_function_calling,
                     ..
                 } = &self.data;
                 let max_input_tokens = stringify_option_value(max_input_tokens);
@@ -145,9 +144,6 @@ impl Model {
                 let mut capabilities = vec![];
                 if *supports_vision {
                     capabilities.push('👁');
-                };
-                if *supports_function_calling {
-                    capabilities.push('⚒');
                 };
                 let capabilities: String = capabilities
                     .into_iter()
@@ -251,19 +247,6 @@ impl Model {
                         MessageContentPart::ImageUrl { .. } => 0,
                     })
                     .sum(),
-                MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results, text, ..
-                }) => {
-                    estimate_token_length(text)
-                        + tool_results
-                            .iter()
-                            .map(|v| {
-                                serde_json::to_string(v)
-                                    .map(|v| estimate_token_length(&v))
-                                    .unwrap_or_default()
-                            })
-                            .sum::<usize>()
-                }
             })
             .sum()
     }
@@ -315,8 +298,6 @@ pub struct ModelData {
     pub require_max_tokens: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub supports_vision: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub supports_function_calling: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     no_stream: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

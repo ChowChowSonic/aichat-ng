@@ -68,6 +68,9 @@ which = "8.0.0"
 fuzzy-matcher = "0.3.7"
 terminal-colorsaurus = "0.4.8"
 duct = "1.0.0"
+rmcp = { version = "1", features = ["client", "transport-child-process", "transport-io", "client-side-sse", "transport-async-rw", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+futures = "0.3"
+sse-stream = "0.2"
 
 [dependencies.reqwest]
 version = "0.12.0"

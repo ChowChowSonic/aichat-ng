@@ -125,9 +125,6 @@ async fn chat_completions_streaming(
     handler: &mut SseHandler,
     _model: &Model,
 ) -> Result<()> {
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
     let handle = |message: SseMmessage| -> Result<bool> {
         if message.data == "[DONE]" {
             return Ok(true);
@@ -140,44 +137,6 @@ async fn chat_completions_streaming(
                     if let Some(text) = data["delta"]["message"]["content"]["text"].as_str() {
                         handler.text(text)?;
                     }
-                }
-                "tool-plan-delta" => {
-                    if let Some(text) = data["delta"]["message"]["tool_plan"].as_str() {
-                        handler.text(text)?;
-                    }
-                }
-                "tool-call-start" => {
-                    if let (Some(function), Some(id)) = (
-                        data["delta"]["message"]["tool_calls"]["function"].as_object(),
-                        data["delta"]["message"]["tool_calls"]["id"].as_str(),
-                    ) {
-                        if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
-                            function_name = name.to_string();
-                        }
-                        function_id = id.to_string();
-                    }
-                }
-                "tool-call-delta" => {
-                    if let Some(text) =
-                        data["delta"]["message"]["tool_calls"]["function"]["arguments"].as_str()
-                    {
-                        function_arguments.push_str(text);
-                    }
-                }
-                "tool-call-end" => {
-                    if !function_name.is_empty() {
-                        let arguments: Value = function_arguments.parse().with_context(|| {
-                            format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                        })?;
-                        handler.tool_call(ToolCall::new(
-                            function_name.clone(),
-                            arguments,
-                            Some(function_id.clone()),
-                        ))?;
-                    }
-                    function_name.clear();
-                    function_arguments.clear();
-                    function_id.clear();
                 }
                 _ => {}
             }
@@ -211,45 +170,20 @@ struct EmbeddingsResBodyEmbeddings {
 }
 
 fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
-    let mut text = data["message"]["content"][0]["text"]
+    let text = data["message"]["content"][0]["text"]
         .as_str()
         .unwrap_or_default()
         .to_string();
 
-    let mut tool_calls = vec![];
-    if let Some(calls) = data["message"]["tool_calls"].as_array() {
-        if text.is_empty() {
-            if let Some(tool_plain) = data["message"]["tool_plan"].as_str() {
-                text = tool_plain.to_string();
-            }
-        }
-        for call in calls {
-            if let (Some(name), Some(arguments), Some(id)) = (
-                call["function"]["name"].as_str(),
-                call["function"]["arguments"].as_str(),
-                call["id"].as_str(),
-            ) {
-                let arguments: Value = arguments.parse().with_context(|| {
-                    format!("Tool call '{name}' have non-JSON arguments '{arguments}'")
-                })?;
-                tool_calls.push(ToolCall::new(
-                    name.to_string(),
-                    arguments,
-                    Some(id.to_string()),
-                ));
-            }
-        }
-    }
-
-    if text.is_empty() && tool_calls.is_empty() {
+    if text.is_empty() {
         bail!("Invalid response data: {data}");
     }
     let output = ChatCompletionsOutput {
         text,
-        tool_calls,
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["billed_units"]["input_tokens"].as_u64(),
         output_tokens: data["usage"]["billed_units"]["output_tokens"].as_u64(),
+        tool_calls: None,
     };
     Ok(output)
 }

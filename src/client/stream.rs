@@ -12,7 +12,7 @@ pub struct SseHandler {
     sender: UnboundedSender<SseEvent>,
     abort_signal: AbortSignal,
     buffer: String,
-    tool_calls: Vec<ToolCall>,
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl SseHandler {
@@ -21,12 +21,11 @@ impl SseHandler {
             sender,
             abort_signal,
             buffer: String::new(),
-            tool_calls: Vec::new(),
+            tool_calls: None,
         }
     }
 
     pub fn text(&mut self, text: &str) -> Result<()> {
-        // debug!("HandleText: {}", text);
         if text.is_empty() {
             return Ok(());
         }
@@ -45,7 +44,6 @@ impl SseHandler {
     }
 
     pub fn done(&mut self) {
-        // debug!("HandleDone");
         let ret = self.sender.send(SseEvent::Done);
         if ret.is_err() {
             if self.abort_signal.aborted() {
@@ -55,25 +53,25 @@ impl SseHandler {
         }
     }
 
-    pub fn tool_call(&mut self, call: ToolCall) -> Result<()> {
-        // debug!("HandleCall: {:?}", call);
-        self.tool_calls.push(call);
-        Ok(())
-    }
-
     pub fn abort(&self) -> AbortSignal {
         self.abort_signal.clone()
     }
 
-    pub fn tool_calls(&self) -> &[ToolCall] {
-        &self.tool_calls
+    pub fn set_tool_calls(&mut self, calls: Vec<ToolCall>) {
+        self.tool_calls = Some(calls);
     }
 
-    pub fn take(self) -> (String, Vec<ToolCall>) {
-        let Self {
-            buffer, tool_calls, ..
-        } = self;
-        (buffer, tool_calls)
+    pub fn take_tool_calls(&mut self) -> Option<Vec<ToolCall>> {
+        self.tool_calls.take()
+    }
+
+    pub fn buffer(&self) -> &str {
+        &self.buffer
+    }
+
+    pub fn take(self) -> String {
+        let Self { buffer, .. } = self;
+        buffer
     }
 }
 

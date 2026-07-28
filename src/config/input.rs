@@ -2,9 +2,8 @@ use super::*;
 
 use crate::client::{
     init_client, patch_messages, ChatCompletionsData, Client, ImageUrl, Message, MessageContent,
-    MessageContentPart, MessageContentToolCalls, MessageRole, Model,
+    MessageContentPart, Model,
 };
-use crate::function::ToolResult;
 use crate::utils::{base64_encode, is_loader_protocol, sha256, AbortSignal};
 
 use anyhow::{bail, Context, Result};
@@ -26,7 +25,6 @@ pub struct Input {
     regenerate: bool,
     medias: Vec<String>,
     data_urls: HashMap<String, String>,
-    tool_calls: Option<MessageContentToolCalls>,
     role: Role,
     rag_name: Option<String>,
     with_session: bool,
@@ -46,7 +44,6 @@ impl Input {
             regenerate: false,
             medias: Default::default(),
             data_urls: Default::default(),
-            tool_calls: None,
             role,
             rag_name: None,
             with_session,
@@ -113,7 +110,6 @@ impl Input {
             regenerate: false,
             medias,
             data_urls,
-            tool_calls: Default::default(),
             role,
             rag_name: None,
             with_session,
@@ -142,10 +138,6 @@ impl Input {
 
     pub fn data_urls(&self) -> HashMap<String, String> {
         self.data_urls.clone()
-    }
-
-    pub fn tool_calls(&self) -> &Option<MessageContentToolCalls> {
-        &self.tool_calls
     }
 
     pub fn text(&self) -> String {
@@ -189,7 +181,6 @@ impl Input {
             self.role = role;
         }
         self.regenerate = true;
-        self.tool_calls = None;
     }
 
     pub async fn use_embeddings(&mut self, abort_signal: AbortSignal) -> Result<()> {
@@ -207,16 +198,6 @@ impl Input {
 
     pub fn rag_name(&self) -> Option<&str> {
         self.rag_name.as_deref()
-    }
-
-    pub fn merge_tool_results(mut self, output: String, tool_results: Vec<ToolResult>) -> Self {
-        match self.tool_calls.as_mut() {
-            Some(exist_tool_results) => {
-                exist_tool_results.merge(tool_results, output);
-            }
-            None => self.tool_calls = Some(MessageContentToolCalls::new(tool_results, output)),
-        }
-        self
     }
 
     pub fn create_client(&self) -> Result<Box<dyn Client>> {
@@ -239,28 +220,21 @@ impl Input {
         patch_messages(&mut messages, model);
         model.guard_max_input_tokens(&messages)?;
         let (temperature, top_p) = (self.role().temperature(), self.role().top_p());
-        let functions = self.config.read().select_functions(self.role());
         Ok(ChatCompletionsData {
             messages,
             temperature,
             top_p,
-            functions,
             stream,
+            tools: None,
         })
     }
 
     pub fn build_messages(&self) -> Result<Vec<Message>> {
-        let mut messages = if let Some(session) = self.session(&self.config.read().session) {
+        let messages = if let Some(session) = self.session(&self.config.read().session) {
             session.build_messages(self)
         } else {
             self.role().build_messages(self)
         };
-        if let Some(tool_calls) = &self.tool_calls {
-            messages.push(Message::new(
-                MessageRole::Assistant,
-                MessageContent::ToolCalls(tool_calls.clone()),
-            ))
-        }
         Ok(messages)
     }
 

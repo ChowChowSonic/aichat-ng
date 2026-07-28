@@ -11,10 +11,11 @@ pub use self::role::{
 use self::session::Session;
 
 use crate::client::{
-    create_client_config, list_client_types, list_models, ClientConfig, MessageContentToolCalls,
+    create_client_config, list_client_types, list_models, ClientConfig,
     Model, ModelType, ProviderModels, OPENAI_COMPATIBLE_PROVIDERS,
 };
-use crate::function::{FunctionDeclaration, Functions, ToolResult};
+use crate::mcp::McpManager;
+use crate::mcp::McpServerConfig;
 use crate::rag::Rag;
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::repl::{run_repl_command, split_args_text};
@@ -56,9 +57,6 @@ const ENV_FILE_NAME: &str = ".env";
 const MESSAGES_FILE_NAME: &str = "messages.md";
 const SESSIONS_DIR_NAME: &str = "sessions";
 const RAGS_DIR_NAME: &str = "rags";
-const FUNCTIONS_DIR_NAME: &str = "functions";
-const FUNCTIONS_FILE_NAME: &str = "functions.json";
-const FUNCTIONS_BIN_DIR_NAME: &str = "bin";
 const AGENTS_DIR_NAME: &str = "agents";
 
 const CLIENTS_FIELD: &str = "clients";
@@ -113,10 +111,6 @@ pub struct Config {
     pub wrap: Option<String>,
     pub wrap_code: bool,
 
-    pub function_calling: bool,
-    pub mapping_tools: IndexMap<String, String>,
-    pub use_tools: Option<String>,
-
     pub repl_prelude: Option<String>,
     pub cmd_prelude: Option<String>,
     pub agent_prelude: Option<String>,
@@ -148,6 +142,9 @@ pub struct Config {
 
     pub clients: Vec<ClientConfig>,
 
+    pub mcp_servers: Vec<McpServerConfig>,
+    pub max_tool_calls: Option<usize>,
+
     #[serde(skip)]
     pub macro_flag: bool,
     #[serde(skip)]
@@ -157,8 +154,6 @@ pub struct Config {
 
     #[serde(skip)]
     pub model: Model,
-    #[serde(skip)]
-    pub functions: Functions,
     #[serde(skip)]
     pub working_mode: WorkingMode,
     #[serde(skip)]
@@ -172,6 +167,9 @@ pub struct Config {
     pub rag: Option<Arc<Rag>>,
     #[serde(skip)]
     pub agent: Option<Agent>,
+
+    #[serde(skip)]
+    pub mcp_manager: Option<Arc<McpManager>>,
 }
 
 impl Default for Config {
@@ -188,10 +186,6 @@ impl Default for Config {
             editor: None,
             wrap: None,
             wrap_code: false,
-
-            function_calling: true,
-            mapping_tools: Default::default(),
-            use_tools: None,
 
             repl_prelude: None,
             cmd_prelude: None,
@@ -223,12 +217,14 @@ impl Default for Config {
 
             clients: vec![],
 
+            mcp_servers: vec![],
+            max_tool_calls: None,
+
             macro_flag: false,
             info_flag: false,
             agent_variables: None,
 
             model: Default::default(),
-            functions: Default::default(),
             working_mode: WorkingMode::Cmd,
             last_message: None,
 
@@ -236,6 +232,8 @@ impl Default for Config {
             session: None,
             rag: None,
             agent: None,
+
+            mcp_manager: None,
         }
     }
 }
@@ -271,8 +269,6 @@ impl Config {
             if let Some(wrap) = config.wrap.clone() {
                 config.set_wrap(&wrap)?;
             }
-
-            config.load_functions()?;
 
             config.setup_model()?;
             config.setup_document_loaders();
@@ -364,21 +360,6 @@ impl Config {
         }
     }
 
-    pub fn functions_dir() -> PathBuf {
-        match env::var(get_env_name("functions_dir")) {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => Self::local_path(FUNCTIONS_DIR_NAME),
-        }
-    }
-
-    pub fn functions_file() -> PathBuf {
-        Self::functions_dir().join(FUNCTIONS_FILE_NAME)
-    }
-
-    pub fn functions_bin_dir() -> PathBuf {
-        Self::functions_dir().join(FUNCTIONS_BIN_DIR_NAME)
-    }
-
     pub fn session_file(&self, name: &str) -> PathBuf {
         match name.split_once("/") {
             Some((dir, name)) => self.sessions_dir().join(dir).join(format!("{name}.yaml")),
@@ -391,6 +372,18 @@ impl Config {
             Some(agent) => Self::agent_rag_file(agent.name(), name),
             None => Self::rags_dir().join(format!("{name}.yaml")),
         }
+    }
+
+    pub fn agents_dir() -> PathBuf {
+        Self::local_path(AGENTS_DIR_NAME)
+    }
+
+    pub fn agents_file() -> PathBuf {
+        Self::local_path("agents.txt")
+    }
+
+    pub fn agent_dir(name: &str) -> PathBuf {
+        Self::agents_dir().join(name)
     }
 
     pub fn agents_data_dir() -> PathBuf {
@@ -413,17 +406,6 @@ impl Config {
 
     pub fn agent_rag_file(agent_name: &str, rag_name: &str) -> PathBuf {
         Self::agent_data_dir(agent_name).join(format!("{rag_name}.yaml"))
-    }
-
-    pub fn agents_functions_dir() -> PathBuf {
-        Self::functions_dir().join(AGENTS_DIR_NAME)
-    }
-
-    pub fn agent_functions_dir(name: &str) -> PathBuf {
-        match env::var(format!("{}_FUNCTIONS_DIR", normalize_env_name(name))) {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => Self::agents_functions_dir().join(name),
-        }
     }
 
     pub fn models_override_file() -> PathBuf {
@@ -532,12 +514,7 @@ impl Config {
             role.clone()
         } else {
             let mut role = Role::default();
-            role.batch_set(
-                &self.model,
-                self.temperature,
-                self.top_p,
-                self.use_tools.clone(),
-            );
+            role.batch_set(&self.model, self.temperature, self.top_p);
             role
         }
     }
@@ -582,7 +559,6 @@ impl Config {
             ("model", role.model().id()),
             ("temperature", format_option_value(&role.temperature())),
             ("top_p", format_option_value(&role.top_p())),
-            ("use_tools", format_option_value(&role.use_tools())),
             (
                 "max_output_tokens",
                 role.model()
@@ -598,7 +574,6 @@ impl Config {
             ),
             ("rag_top_k", rag_top_k.to_string()),
             ("dry_run", self.dry_run.to_string()),
-            ("function_calling", self.function_calling.to_string()),
             ("stream", self.stream.to_string()),
             ("save", self.save.to_string()),
             ("keybindings", self.keybindings.clone()),
@@ -612,7 +587,6 @@ impl Config {
             ("sessions_dir", display_path(&self.sessions_dir())),
             ("rags_dir", display_path(&Self::rags_dir())),
             ("macros_dir", display_path(&Self::macros_dir())),
-            ("functions_dir", display_path(&Self::functions_dir())),
             ("messages_file", display_path(&self.messages_file())),
         ];
         if let Ok((_, Some(log_path))) = Self::log_config(self.working_mode.is_serve()) {
@@ -642,10 +616,6 @@ impl Config {
                 let value = parse_value(value)?;
                 config.write().set_top_p(value);
             }
-            "use_tools" => {
-                let value = parse_value(value)?;
-                config.write().set_use_tools(value);
-            }
             "max_output_tokens" => {
                 let value = parse_value(value)?;
                 config.write().set_max_output_tokens(value);
@@ -669,13 +639,6 @@ impl Config {
             "dry_run" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
                 config.write().dry_run = value;
-            }
-            "function_calling" => {
-                let value = value.parse().with_context(|| "Invalid value")?;
-                if value && config.write().functions.is_empty() {
-                    bail!("Function calling cannot be enabled because no functions are installed.")
-                }
-                config.write().function_calling = value;
             }
             "stream" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
@@ -774,13 +737,6 @@ impl Config {
         match self.role_like_mut() {
             Some(role_like) => role_like.set_top_p(value),
             None => self.top_p = value,
-        }
-    }
-
-    pub fn set_use_tools(&mut self, value: Option<String>) {
-        match self.role_like_mut() {
-            Some(role_like) => role_like.set_use_tools(value),
-            None => self.use_tools = value,
         }
     }
 
@@ -1130,16 +1086,7 @@ impl Config {
         if let Some(session) = &self.session {
             let render_options = self.render_options()?;
             let mut markdown_render = MarkdownRender::init(render_options)?;
-            let agent_info: Option<(String, Vec<String>)> = self.agent.as_ref().map(|agent| {
-                let functions = agent
-                    .functions()
-                    .declarations()
-                    .iter()
-                    .filter_map(|v| if v.agent { Some(v.name.clone()) } else { None })
-                    .collect();
-                (agent.name().to_string(), functions)
-            });
-            session.render(&mut markdown_render, &agent_info)
+                session.render(&mut markdown_render, self.agent.as_ref().map(|agent| agent.name()))
         } else {
             bail!("No session")
         }
@@ -1491,9 +1438,6 @@ impl Config {
         session_name: Option<&str>,
         abort_signal: AbortSignal,
     ) -> Result<()> {
-        if !config.read().function_calling {
-            bail!("Please enable function calling before using the agent.");
-        }
         if config.read().agent.is_some() {
             bail!("Already in a agent, please run '.exit agent' first to exit the current agent.");
         }
@@ -1649,75 +1593,6 @@ impl Config {
         Ok(())
     }
 
-    pub fn select_functions(&self, role: &Role) -> Option<Vec<FunctionDeclaration>> {
-        let mut functions = vec![];
-        if self.function_calling {
-            if let Some(use_tools) = role.use_tools() {
-                let mut tool_names: HashSet<String> = Default::default();
-                let declaration_names: HashSet<String> = self
-                    .functions
-                    .declarations()
-                    .iter()
-                    .map(|v| v.name.to_string())
-                    .collect();
-                if use_tools == "all" {
-                    tool_names.extend(declaration_names);
-                } else {
-                    for item in use_tools.split(',') {
-                        let item = item.trim();
-                        if let Some(values) = self.mapping_tools.get(item) {
-                            tool_names.extend(
-                                values
-                                    .split(',')
-                                    .map(|v| v.to_string())
-                                    .filter(|v| declaration_names.contains(v)),
-                            )
-                        } else if declaration_names.contains(item) {
-                            tool_names.insert(item.to_string());
-                        }
-                    }
-                }
-                functions = self
-                    .functions
-                    .declarations()
-                    .iter()
-                    .filter_map(|v| {
-                        if tool_names.contains(&v.name) {
-                            Some(v.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-            }
-
-            if let Some(agent) = &self.agent {
-                let mut agent_functions = agent.functions().declarations().to_vec();
-                let tool_names: HashSet<String> = agent_functions
-                    .iter()
-                    .filter_map(|v| {
-                        if v.agent {
-                            None
-                        } else {
-                            Some(v.name.to_string())
-                        }
-                    })
-                    .collect();
-                agent_functions.extend(
-                    functions
-                        .into_iter()
-                        .filter(|v| !tool_names.contains(&v.name)),
-                );
-                functions = agent_functions;
-            }
-        };
-        if functions.is_empty() {
-            None
-        } else {
-            Some(functions)
-        }
-    }
-
     pub fn editor(&self) -> Result<String> {
         EDITOR.get_or_init(move || {
             let editor = self.editor.clone()
@@ -1779,14 +1654,12 @@ impl Config {
                     let mut values = vec![
                         "temperature",
                         "top_p",
-                        "use_tools",
                         "save_session",
                         "compress_threshold",
                         "rag_reranker_model",
                         "rag_top_k",
                         "max_output_tokens",
                         "dry_run",
-                        "function_calling",
                         "stream",
                         "save",
                         "highlight",
@@ -1811,26 +1684,6 @@ impl Config {
                 "dry_run" => complete_bool(self.dry_run),
                 "stream" => complete_bool(self.stream),
                 "save" => complete_bool(self.save),
-                "function_calling" => complete_bool(self.function_calling),
-                "use_tools" => {
-                    let mut prefix = String::new();
-                    let mut ignores = HashSet::new();
-                    if let Some((v, _)) = args[1].rsplit_once(',') {
-                        ignores = v.split(',').collect();
-                        prefix = format!("{v},");
-                    }
-                    let mut values = vec![];
-                    if prefix.is_empty() {
-                        values.push("all".to_string());
-                    }
-                    values.extend(self.functions.declarations().iter().map(|v| v.name.clone()));
-                    values.extend(self.mapping_tools.keys().map(|v| v.to_string()));
-                    values
-                        .into_iter()
-                        .filter(|v| !ignores.contains(v.as_str()))
-                        .map(|v| format!("{prefix}{v}"))
-                        .collect()
-                }
                 "save_session" => {
                     let save_session = if let Some(session) = &self.session {
                         session.save_session()
@@ -2055,11 +1908,7 @@ impl Config {
         &mut self,
         input: &Input,
         output: &str,
-        tool_results: &[ToolResult],
     ) -> Result<()> {
-        if !tool_results.is_empty() {
-            return Ok(());
-        }
         self.last_message = Some(LastMessage::new(input.clone(), output.to_string()));
         if !self.dry_run {
             self.save_message(input, output)?;
@@ -2085,7 +1934,7 @@ impl Config {
             return Ok(());
         }
         let mut file = self.open_message_file()?;
-        if output.is_empty() && input.tool_calls().is_none() {
+        if output.is_empty() {
             return Ok(());
         }
         let now = now();
@@ -2106,22 +1955,8 @@ impl Config {
         } else {
             String::new()
         };
-        let tool_calls = match input.tool_calls() {
-            Some(MessageContentToolCalls {
-                tool_results, text, ..
-            }) => {
-                let mut lines = vec!["<tool_calls>".to_string()];
-                if !text.is_empty() {
-                    lines.push(text.clone());
-                }
-                lines.push(serde_json::to_string(&tool_results).unwrap_or_default());
-                lines.push("</tool_calls>\n".to_string());
-                lines.join("\n")
-            }
-            None => String::new(),
-        };
         let output = format!(
-            "# CHAT: {summary} [{now}]{scope}\n{raw_input}\n--------\n{tool_calls}{output}\n--------\n\n",
+            "# CHAT: {summary} [{now}]{scope}\n{raw_input}\n--------\n{output}\n--------\n\n",
         );
         file.write_all(output.as_bytes())
             .with_context(|| "Failed to save message")
@@ -2143,9 +1978,6 @@ impl Config {
                 self.info_flag,
             )?;
             agent.set_shared_variables(new_variables);
-        }
-        if !self.info_flag {
-            agent.update_shared_dynamic_instructions(false)?;
         }
         Ok(())
     }
@@ -2174,16 +2006,10 @@ impl Config {
                     shared_variables
                 };
             agent.set_session_variables(session_variables);
-            if !self.info_flag {
-                agent.update_session_dynamic_instructions(None)?;
-            }
             session.sync_agent(agent);
         } else {
             let variables = session.agent_variables();
             agent.set_session_variables(variables.clone());
-            agent.update_session_dynamic_instructions(Some(
-                session.agent_instructions().to_string(),
-            ))?;
         }
         Ok(())
     }
@@ -2280,18 +2106,6 @@ impl Config {
             self.wrap_code = v;
         }
 
-        if let Some(Some(v)) = read_env_bool(&get_env_name("function_calling")) {
-            self.function_calling = v;
-        }
-        if let Ok(v) = env::var(get_env_name("mapping_tools")) {
-            if let Ok(v) = serde_json::from_str(&v) {
-                self.mapping_tools = v;
-            }
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("use_tools")) {
-            self.use_tools = v;
-        }
-
         if let Some(v) = read_env_value::<String>(&get_env_name("repl_prelude")) {
             self.repl_prelude = v;
         }
@@ -2378,11 +2192,6 @@ impl Config {
         if let Some(v) = read_env_value::<String>(&get_env_name("sync_models_url")) {
             self.sync_models_url = v;
         }
-    }
-
-    fn load_functions(&mut self) -> Result<()> {
-        self.functions = Functions::init(&Self::functions_file())?;
-        Ok(())
     }
 
     fn setup_model(&mut self) -> Result<()> {
@@ -2476,7 +2285,6 @@ pub async fn macro_execute(
     let mut config = config.read().clone();
     config.temperature = role.temperature();
     config.top_p = role.top_p();
-    config.use_tools = role.use_tools().clone();
     config.macro_flag = true;
     config.model = role.model().clone();
     config.role = None;

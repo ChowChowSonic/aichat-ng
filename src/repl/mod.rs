@@ -31,7 +31,7 @@ use std::{env, process};
 
 const MENU_NAME: &str = "completion_menu";
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 36]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 37]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -183,6 +183,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 36]> = LazyLock::new(|| {
             "Delete roles, sessions, RAGs, or agents",
             AssertState::pass(),
         ),
+        ReplCommand::new(".mcp", "Show MCP server status and available tools", AssertState::pass()),
         ReplCommand::new(".exit", "Exit REPL", AssertState::pass()),
     ]
 });
@@ -673,6 +674,9 @@ pub async fn run_repl_command(
                 };
                 set_text(&output).context("Failed to copy the last chat response")?;
             }
+            ".mcp" => {
+                mcp_status(config).await?;
+            }
             ".exit" => match args {
                 Some("role") => {
                     config.write().exit_role()?;
@@ -735,27 +739,17 @@ async fn ask(
 
     let client = input.create_client()?;
     config.write().before_chat_completion(&input)?;
-    let (output, tool_results) = if input.stream() {
+    let output = if input.stream() {
         call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await?
     } else {
         call_chat_completions(&input, true, false, client.as_ref(), abort_signal.clone()).await?
     };
     config
         .write()
-        .after_chat_completion(&input, &output, &tool_results)?;
-    if !tool_results.is_empty() {
-        ask(
-            config,
-            abort_signal,
-            input.merge_tool_results(output, tool_results),
-            false,
-        )
-        .await
-    } else {
-        Config::maybe_autoname_session(config.clone());
-        Config::maybe_compress_session(config.clone());
-        Ok(())
-    }
+        .after_chat_completion(&input, &output)?;
+    Config::maybe_autoname_session(config.clone());
+    Config::maybe_compress_session(config.clone());
+    Ok(())
 }
 
 fn unknown_command() -> Result<()> {
@@ -775,6 +769,39 @@ Type ::: to start multi-line editing, type ::: to finish it.
 Press Ctrl+O to open an editor for editing the input buffer.
 Press Ctrl+C to cancel the response, Ctrl+D to exit the REPL."###,
     );
+}
+
+async fn mcp_status(config: &GlobalConfig) -> Result<()> {
+    match &config.read().mcp_manager {
+        None => {
+            println!("No MCP servers configured.");
+            println!("Add them under `mcp_servers:` in your config.yaml");
+        }
+        Some(manager) => {
+            let servers = manager.server_names();
+            if servers.is_empty() {
+                println!("No MCP servers connected.");
+                return Ok(());
+            }
+            println!("Connected MCP servers:");
+            for server_name in servers {
+                let transport = manager
+                    .server_transport(server_name)
+                    .map(|t| t.to_string())
+                    .unwrap_or_default();
+                println!("  {server_name} ({transport})");
+                for tool in manager.tools_for_server(server_name) {
+                    let desc = if tool.description.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" - {desc}", desc = tool.description)
+                    };
+                    println!("    - {name}{desc}", name = tool.name);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_command(line: &str) -> Option<(&str, Option<&str>)> {

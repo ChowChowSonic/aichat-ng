@@ -37,6 +37,8 @@ pub static CODE_BLOCK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?ms)```\w*(.*)```").unwrap());
 pub static THINK_TAG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)^\s*<think>.*?</think>(\s*|$)").unwrap());
+pub static TOOL_CALL_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<tool_call>.*?</tool_call>").unwrap());
 pub static IS_STDOUT_TERMINAL: LazyLock<bool> = LazyLock::new(|| std::io::stdout().is_terminal());
 pub static NO_COLOR: LazyLock<bool> = LazyLock::new(|| {
     env::var("NO_COLOR")
@@ -90,6 +92,10 @@ pub fn estimate_token_length(text: &str) -> usize {
 
 pub fn strip_think_tag(text: &str) -> Cow<'_, str> {
     THINK_TAG_RE.replace_all(text, "")
+}
+
+pub fn strip_tool_call_tag(text: &str) -> Cow<'_, str> {
+    TOOL_CALL_TAG_RE.replace_all(text, "")
 }
 
 pub fn extract_code_block(text: &str) -> &str {

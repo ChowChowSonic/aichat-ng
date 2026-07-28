@@ -25,8 +25,6 @@ pub struct Session {
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    use_tools: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     save_session: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compress_threshold: Option<usize>,
@@ -154,9 +152,6 @@ impl Session {
         if let Some(top_p) = self.top_p() {
             data["top_p"] = top_p.into();
         }
-        if let Some(use_tools) = self.use_tools() {
-            data["use_tools"] = use_tools.into();
-        }
         if let Some(save_session) = self.save_session() {
             data["save_session"] = save_session.into();
         }
@@ -178,7 +173,7 @@ impl Session {
     pub fn render(
         &self,
         render: &mut MarkdownRender,
-        agent_info: &Option<(String, Vec<String>)>,
+        _agent_name: Option<&str>,
     ) -> Result<String> {
         let mut items = vec![];
 
@@ -197,10 +192,6 @@ impl Session {
         }
         if let Some(top_p) = self.top_p() {
             items.push(("top_p", top_p.to_string()));
-        }
-
-        if let Some(use_tools) = self.use_tools() {
-            items.push(("use_tools", use_tools));
         }
 
         if let Some(save_session) = self.save_session() {
@@ -230,7 +221,7 @@ impl Session {
                     MessageRole::System => {
                         lines.push(
                             render
-                                .render(&message.content.render_input(resolve_url_fn, agent_info)),
+                                .render(&message.content.render_input(resolve_url_fn, &None)),
                         );
                     }
                     MessageRole::Assistant => {
@@ -242,12 +233,10 @@ impl Session {
                     MessageRole::User => {
                         lines.push(format!(
                             ">> {}",
-                            message.content.render_input(resolve_url_fn, agent_info)
+                            message.content.render_input(resolve_url_fn, &None)
                         ));
                     }
-                    MessageRole::Tool => {
-                        lines.push(message.content.render_input(resolve_url_fn, agent_info));
-                    }
+                    MessageRole::Tool => {}
                 }
             }
         }
@@ -271,7 +260,6 @@ impl Session {
         self.model_id = role.model().id();
         self.temperature = role.temperature();
         self.top_p = role.top_p();
-        self.use_tools = role.use_tools();
         self.model = role.model().clone();
         self.role_name = convert_option_string(role.name());
         self.role_prompt = role.prompt().to_string();
@@ -295,6 +283,7 @@ impl Session {
         &self.agent_variables
     }
 
+    #[allow(dead_code)]
     pub fn agent_instructions(&self) -> &str {
         &self.agent_instructions
     }
@@ -492,12 +481,6 @@ impl Session {
                     .push(Message::new(MessageRole::User, input.message_content()));
             }
             self.data_urls.extend(input.data_urls());
-            if let Some(tool_calls) = input.tool_calls() {
-                self.messages.push(Message::new(
-                    MessageRole::Tool,
-                    MessageContent::ToolCalls(tool_calls.clone()),
-                ))
-            }
             self.messages.push(Message::new(
                 MessageRole::Assistant,
                 MessageContent::Text(output.to_string()),
@@ -577,10 +560,6 @@ impl RoleLike for Session {
         self.top_p
     }
 
-    fn use_tools(&self) -> Option<String> {
-        self.use_tools.clone()
-    }
-
     fn set_model(&mut self, model: Model) {
         if self.model().id() != model.id() {
             self.model_id = model.id();
@@ -600,13 +579,6 @@ impl RoleLike for Session {
     fn set_top_p(&mut self, value: Option<f64>) {
         if self.top_p != value {
             self.top_p = value;
-            self.dirty = true;
-        }
-    }
-
-    fn set_use_tools(&mut self, value: Option<String>) {
-        if self.use_tools != value {
-            self.use_tools = value;
             self.dirty = true;
         }
     }

@@ -201,9 +201,6 @@ async fn chat_completions_streaming(
         bail!("Invalid response data: {data}");
     }
 
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
     let mut reasoning_state = 0;
 
     let mut stream = res.bytes_stream();
@@ -221,32 +218,6 @@ async fn chat_completions_streaming(
                     let data: Value = serde_json::from_slice(message.payload())?;
                     debug!("stream-data: {smithy_type} {data}");
                     match smithy_type {
-                        "contentBlockStart" => {
-                            if let Some(tool_use) = data["start"]["toolUse"].as_object() {
-                                if let (Some(id), Some(name)) = (
-                                    json_str_from_map(tool_use, "toolUseId"),
-                                    json_str_from_map(tool_use, "name"),
-                                ) {
-                                    if !function_name.is_empty() {
-                                        if function_arguments.is_empty() {
-                                            function_arguments = String::from("{}");
-                                        }
-                                        let arguments: Value =
-                                        function_arguments.parse().with_context(|| {
-                                            format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                                        })?;
-                                        handler.tool_call(ToolCall::new(
-                                            function_name.clone(),
-                                            arguments,
-                                            Some(function_id.clone()),
-                                        ))?;
-                                    }
-                                    function_arguments.clear();
-                                    function_name = name.into();
-                                    function_id = id.into();
-                                }
-                            }
-                        }
                         "contentBlockDelta" => {
                             if let Some(text) = data["delta"]["text"].as_str() {
                                 handler.text(text)?;
@@ -258,27 +229,12 @@ async fn chat_completions_streaming(
                                     reasoning_state = 1;
                                 }
                                 handler.text(text)?;
-                            } else if let Some(input) = data["delta"]["toolUse"]["input"].as_str() {
-                                function_arguments.push_str(input);
                             }
                         }
                         "contentBlockStop" => {
                             if reasoning_state == 1 {
                                 handler.text("\n</think>\n\n")?;
                                 reasoning_state = 0;
-                            }
-                            if !function_name.is_empty() {
-                                if function_arguments.is_empty() {
-                                    function_arguments = String::from("{}");
-                                }
-                                let arguments: Value = function_arguments.parse().with_context(|| {
-                                    format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                                })?;
-                                handler.tool_call(ToolCall::new(
-                                    function_name.clone(),
-                                    arguments,
-                                    Some(function_id.clone()),
-                                ))?;
                             }
                         }
                         _ => {}
@@ -323,8 +279,8 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
         mut messages,
         temperature,
         top_p,
-        functions,
         stream: _,
+        tools: _,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -335,20 +291,25 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
     let messages: Vec<Value> = messages
         .into_iter()
         .enumerate()
-        .flat_map(|(i, message)| {
-            let Message { role, content } = message;
+        .map(|(i, message)| {
+            let Message {
+                role,
+                content,
+                tool_call_id: _,
+                tool_calls: _,
+            } = message;
             match content {
                 MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {
-                    vec![json!({ "role": role, "content": [ { "text": strip_think_tag(&text) } ] })]
+                    json!({ "role": role, "content": [ { "text": strip_think_tag(&text) } ] })
                 }
-                MessageContent::Text(text) => vec![json!({
+                MessageContent::Text(text) => json!({
                     "role": role,
                     "content": [
                         {
                             "text": text,
                         }
                     ],
-                })],
+                }),
                 MessageContent::Array(list) => {
                     let content: Vec<_> = list
                         .into_iter()
@@ -378,50 +339,10 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
                             }
                         })
                         .collect();
-                    vec![json!({
+                    json!({
                         "role": role,
                         "content": content,
-                    })]
-                }
-                MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results, text, ..
-                }) => {
-                    let mut assistant_parts = vec![];
-                    let mut user_parts = vec![];
-                    if !text.is_empty() {
-                        assistant_parts.push(json!({
-                            "text": text,
-                        }))
-                    }
-                    for tool_result in tool_results {
-                        assistant_parts.push(json!({
-                            "toolUse": {
-                                "toolUseId": tool_result.call.id,
-                                "name": tool_result.call.name,
-                                "input": tool_result.call.arguments,
-                            }
-                        }));
-                        user_parts.push(json!({
-                            "toolResult": {
-                                "toolUseId": tool_result.call.id,
-                                "content": [
-                                    {
-                                        "json": tool_result.output,
-                                    }
-                                ]
-                            }
-                        }));
-                    }
-                    vec![
-                        json!({
-                            "role": "assistant",
-                            "content": assistant_parts,
-                        }),
-                        json!({
-                            "role": "user",
-                            "content": user_parts,
-                        }),
-                    ]
+                    })
                 }
             }
         })
@@ -455,32 +376,12 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
     if let Some(v) = top_p {
         body["inferenceConfig"]["topP"] = v.into();
     }
-    if let Some(functions) = functions {
-        let tools: Vec<_> = functions
-            .iter()
-            .map(|v| {
-                json!({
-                    "toolSpec": {
-                        "name": v.name,
-                        "description": v.description,
-                        "inputSchema": {
-                            "json": v.parameters,
-                        },
-                    }
-                })
-            })
-            .collect();
-        body["toolConfig"] = json!({
-            "tools": tools,
-        })
-    }
     Ok(body)
 }
 
 fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     let mut text = String::new();
     let mut reasoning = None;
-    let mut tool_calls = vec![];
     if let Some(array) = data["output"]["message"]["content"].as_array() {
         for item in array {
             if let Some(v) = item["text"].as_str() {
@@ -494,18 +395,6 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
                 if let Some(text) = json_str_from_map(reasoning_text, "text") {
                     reasoning = Some(text.to_string());
                 }
-            } else if let Some(tool_use) = item["toolUse"].as_object() {
-                if let (Some(id), Some(name), Some(input)) = (
-                    json_str_from_map(tool_use, "toolUseId"),
-                    json_str_from_map(tool_use, "name"),
-                    tool_use.get("input"),
-                ) {
-                    tool_calls.push(ToolCall::new(
-                        name.to_string(),
-                        input.clone(),
-                        Some(id.to_string()),
-                    ))
-                }
             }
         }
     }
@@ -514,16 +403,16 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         text = format!("<think>\n{reasoning}\n</think>\n\n{text}")
     }
 
-    if text.is_empty() && tool_calls.is_empty() {
+    if text.is_empty() {
         bail!("Invalid response data: {data}");
     }
 
     let output = ChatCompletionsOutput {
         text,
-        tool_calls,
         id: None,
         input_tokens: data["usage"]["inputTokens"].as_u64(),
         output_tokens: data["usage"]["outputTokens"].as_u64(),
+        tool_calls: None,
     };
     Ok(output)
 }

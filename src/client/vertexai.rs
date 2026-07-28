@@ -215,11 +215,6 @@ pub async fn gemini_chat_completions_streaming(
                             handler.text("\n\n")?;
                         }
                         handler.text(text)?;
-                    } else if let (Some(name), Some(args)) = (
-                        part["functionCall"]["name"].as_str(),
-                        part["functionCall"]["args"].as_object(),
-                    ) {
-                        handler.tool_call(ToolCall::new(name.to_string(), json!(args), None))?;
                     }
                 }
             } else if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
@@ -270,23 +265,16 @@ struct EmbeddingsResBodyPredictionEmbeddings {
 
 fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsOutput> {
     let mut text_parts = vec![];
-    let mut tool_calls = vec![];
     if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
         for part in parts {
             if let Some(text) = part["text"].as_str() {
                 text_parts.push(text);
             }
-            if let (Some(name), Some(args)) = (
-                part["functionCall"]["name"].as_str(),
-                part["functionCall"]["args"].as_object(),
-            ) {
-                tool_calls.push(ToolCall::new(name.to_string(), json!(args), None));
-            }
         }
     }
 
     let text = text_parts.join("\n\n");
-    if text.is_empty() && tool_calls.is_empty() {
+    if text.is_empty() {
         if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
             .as_str()
             .or_else(|| data["candidates"][0]["finishReason"].as_str())
@@ -298,10 +286,10 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
     }
     let output = ChatCompletionsOutput {
         text,
-        tool_calls,
         id: None,
         input_tokens: data["usageMetadata"]["promptTokenCount"].as_u64(),
         output_tokens: data["usageMetadata"]["candidatesTokenCount"].as_u64(),
+        tool_calls: None,
     };
     Ok(output)
 }
@@ -314,8 +302,8 @@ pub fn gemini_build_chat_completions_body(
         mut messages,
         temperature,
         top_p,
-        functions,
         stream: _,
+        tools: _,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -323,17 +311,22 @@ pub fn gemini_build_chat_completions_body(
     let mut network_image_urls = vec![];
     let contents: Vec<Value> = messages
         .into_iter()
-        .flat_map(|message| {
-            let Message { role, content } = message;
+        .map(|message| {
+            let Message {
+                role,
+                content,
+                tool_call_id: _,
+                tool_calls: _,
+            } = message;
             let role = match role {
                 MessageRole::User => "user",
                 _ => "model",
             };
                match content {
-                    MessageContent::Text(text) => vec![json!({
+                    MessageContent::Text(text) => json!({
                         "role": role,
                         "parts": [{ "text": text }]
-                    })],
+                    }),
                     MessageContent::Array(list) => {
                         let parts: Vec<Value> = list
                             .into_iter()
@@ -349,33 +342,8 @@ pub fn gemini_build_chat_completions_body(
                                 },
                             })
                             .collect();
-                        vec![json!({ "role": role, "parts": parts })]
+                        json!({ "role": role, "parts": parts })
                     },
-                    MessageContent::ToolCalls(MessageContentToolCalls { tool_results, .. }) => {
-                        let model_parts: Vec<Value> = tool_results.iter().map(|tool_result| {
-                            json!({
-                                "functionCall": {
-                                    "name": tool_result.call.name,
-                                    "args": tool_result.call.arguments,
-                                }
-                            })
-                        }).collect();
-                        let function_parts: Vec<Value> = tool_results.into_iter().map(|tool_result| {
-                            json!({
-                                "functionResponse": {
-                                    "name": tool_result.call.name,
-                                    "response": {
-                                        "name": tool_result.call.name,
-                                        "content": tool_result.output,
-                                    }
-                                }
-                            })
-                        }).collect();
-                        vec![
-                            json!({ "role": "model", "parts": model_parts }),
-                            json!({ "role": "function", "parts": function_parts }),
-                        ]
-                    }
                 }
         })
         .collect();
@@ -401,24 +369,6 @@ pub fn gemini_build_chat_completions_body(
     }
     if let Some(v) = top_p {
         body["generationConfig"]["topP"] = v.into();
-    }
-
-    if let Some(functions) = functions {
-        // Gemini doesn't support functions with parameters that have empty properties, so we need to patch it.
-        let function_declarations: Vec<_> = functions
-            .into_iter()
-            .map(|function| {
-                if function.parameters.is_empty_properties() {
-                    json!({
-                        "name": function.name,
-                        "description": function.description,
-                    })
-                } else {
-                    json!(function)
-                }
-            })
-            .collect();
-        body["tools"] = json!([{ "functionDeclarations": function_declarations }]);
     }
 
     Ok(body)

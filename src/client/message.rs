@@ -1,6 +1,6 @@
-use super::Model;
+use super::{Model, ToolCall};
 
-use crate::{function::ToolResult, multiline_text, utils::dimmed_text};
+use crate::multiline_text;
 
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 pub struct Message {
     pub role: MessageRole,
     pub content: MessageContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl Default for Message {
@@ -15,13 +19,20 @@ impl Default for Message {
         Self {
             role: MessageRole::User,
             content: MessageContent::Text(String::new()),
+            tool_call_id: None,
+            tool_calls: None,
         }
     }
 }
 
 impl Message {
     pub fn new(role: MessageRole, content: MessageContent) -> Self {
-        Self { role, content }
+        Self {
+            role,
+            content,
+            tool_call_id: None,
+            tool_calls: None,
+        }
     }
 
     pub fn merge_system(&mut self, system: MessageContent) {
@@ -47,7 +58,6 @@ impl Message {
                 system_list.append(list);
                 self.content = MessageContent::Array(system_list);
             }
-            _ => {}
         }
     }
 }
@@ -74,6 +84,10 @@ impl MessageRole {
     pub fn is_assistant(&self) -> bool {
         matches!(self, MessageRole::Assistant)
     }
+
+    pub fn is_tool(&self) -> bool {
+        matches!(self, MessageRole::Tool)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -81,15 +95,13 @@ impl MessageRole {
 pub enum MessageContent {
     Text(String),
     Array(Vec<MessageContentPart>),
-    // Note: This type is primarily for convenience and does not exist in OpenAI's API.
-    ToolCalls(MessageContentToolCalls),
 }
 
 impl MessageContent {
     pub fn render_input(
         &self,
         resolve_url_fn: impl Fn(&str) -> String,
-        agent_info: &Option<(String, Vec<String>)>,
+        _agent_info: &Option<(String, Vec<String>)>,
     ) -> String {
         match self {
             MessageContent::Text(text) => multiline_text(text),
@@ -110,26 +122,6 @@ impl MessageContent {
                 }
                 format!(".file {}{}", files.join(" "), concated_text)
             }
-            MessageContent::ToolCalls(MessageContentToolCalls {
-                tool_results, text, ..
-            }) => {
-                let mut lines = vec![];
-                if !text.is_empty() {
-                    lines.push(text.clone())
-                }
-                for tool_result in tool_results {
-                    let mut parts = vec!["Call".to_string()];
-                    if let Some((agent_name, functions)) = agent_info {
-                        if functions.contains(&tool_result.call.name) {
-                            parts.push(agent_name.clone())
-                        }
-                    }
-                    parts.push(tool_result.call.name.clone());
-                    parts.push(tool_result.call.arguments.to_string());
-                    lines.push(dimmed_text(&parts.join(" ")));
-                }
-                lines.join("\n")
-            }
         }
     }
 
@@ -145,7 +137,6 @@ impl MessageContent {
                     *text = replace_fn(text)
                 }
             }
-            MessageContent::ToolCalls(_) => {}
         }
     }
 
@@ -161,7 +152,6 @@ impl MessageContent {
                 }
                 parts.join("\n\n")
             }
-            MessageContent::ToolCalls(_) => String::new(),
         }
     }
 }
@@ -178,29 +168,6 @@ pub struct ImageUrl {
     pub url: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct MessageContentToolCalls {
-    pub tool_results: Vec<ToolResult>,
-    pub text: String,
-    pub sequence: bool,
-}
-
-impl MessageContentToolCalls {
-    pub fn new(tool_results: Vec<ToolResult>, text: String) -> Self {
-        Self {
-            tool_results,
-            text,
-            sequence: false,
-        }
-    }
-
-    pub fn merge(&mut self, tool_results: Vec<ToolResult>, _text: String) {
-        self.tool_results.extend(tool_results);
-        self.text.clear();
-        self.sequence = true;
-    }
-}
-
 pub fn patch_messages(messages: &mut Vec<Message>, model: &Model) {
     if messages.is_empty() {
         return;
@@ -214,6 +181,8 @@ pub fn patch_messages(messages: &mut Vec<Message>, model: &Model) {
                 Message {
                     role: MessageRole::System,
                     content: MessageContent::Text(prefix.to_string()),
+                    tool_call_id: None,
+                    tool_calls: None,
                 },
             );
         }

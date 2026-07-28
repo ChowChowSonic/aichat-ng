@@ -1,7 +1,7 @@
 mod cli;
 mod client;
 mod config;
-mod function;
+mod mcp;
 mod rag;
 mod render;
 mod repl;
@@ -53,6 +53,14 @@ async fn main() -> Result<()> {
         || cli.list_sessions;
     setup_logger(working_mode.is_serve())?;
     let config = Arc::new(RwLock::new(Config::init(working_mode, info_flag).await?));
+    {
+        let mcp_servers = config.read().mcp_servers.clone();
+        if !mcp_servers.is_empty() {
+            let manager = crate::mcp::McpManager::init(&mcp_servers).await;
+            let manager = Arc::new(manager);
+            config.write().mcp_manager = Some(manager);
+        }
+    }
     if let Err(err) = run(config, cli, text).await {
         render_error(err);
         std::process::exit(1);
@@ -202,7 +210,10 @@ async fn start_directive(
     let client = input.create_client()?;
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
     config.write().before_chat_completion(&input)?;
-    let (output, tool_results) = if !input.stream() || extract_code {
+    let use_streaming = input.stream() && !extract_code;
+    let output = if use_streaming {
+        call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await?
+    } else {
         call_chat_completions(
             &input,
             true,
@@ -211,22 +222,10 @@ async fn start_directive(
             abort_signal.clone(),
         )
         .await?
-    } else {
-        call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await?
     };
     config
         .write()
-        .after_chat_completion(&input, &output, &tool_results)?;
-
-    if !tool_results.is_empty() {
-        start_directive(
-            config,
-            input.merge_tool_results(output, tool_results),
-            code_mode,
-            abort_signal,
-        )
-        .await?;
-    }
+        .after_chat_completion(&input, &output)?;
 
     config.write().exit_session()?;
     Ok(())
@@ -246,12 +245,12 @@ async fn shell_execute(
 ) -> Result<()> {
     let client = input.create_client()?;
     config.write().before_chat_completion(&input)?;
-    let (eval_str, _) =
+    let eval_str =
         call_chat_completions(&input, false, true, client.as_ref(), abort_signal.clone()).await?;
 
     config
         .write()
-        .after_chat_completion(&input, &eval_str, &[])?;
+        .after_chat_completion(&input, &eval_str)?;
     if eval_str.is_empty() {
         bail!("No command generated");
     }

@@ -2,7 +2,6 @@ use super::*;
 
 use crate::{
     config::{Config, GlobalConfig, Input},
-    function::{eval_tool_calls, FunctionDeclaration, ToolCall, ToolResult},
     render::render_stream,
     utils::*,
 };
@@ -14,7 +13,7 @@ use inquire::{
     list_option::ListOption, required, validator::Validation, MultiSelect, Select, Text,
 };
 use reqwest::{Client as ReqwestClient, RequestBuilder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -277,28 +276,58 @@ impl RequestData {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub function: ToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolFunction {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub function: ToolCallFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ChatCompletionsData {
     pub messages: Vec<Message>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
-    pub functions: Option<Vec<FunctionDeclaration>>,
     pub stream: bool,
+    pub tools: Option<Vec<ToolDefinition>>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ChatCompletionsOutput {
     pub text: String,
-    pub tool_calls: Vec<ToolCall>,
     pub id: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl ChatCompletionsOutput {
     pub fn new(text: &str) -> Self {
         Self {
             text: text.to_string(),
+            tool_calls: None,
             ..Default::default()
         }
     }
@@ -403,75 +432,304 @@ pub async fn create_openai_compatible_client_config(
     Ok(Some((model, clients)))
 }
 
+fn format_tool_args(args_json: &str) -> String {
+    let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
+    match args {
+        Value::Object(map) => {
+            let parts: Vec<String> = map
+                .values()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Number(n) => Some(n.to_string()),
+                    Value::Bool(b) => Some(b.to_string()),
+                    _ => None,
+                })
+                .collect();
+            if parts.is_empty() {
+                args_json.to_string()
+            } else {
+                parts.join(", ")
+            }
+        }
+        Value::String(s) => s,
+        _ => args_json.to_string(),
+    }
+}
+
 pub async fn call_chat_completions(
     input: &Input,
     print: bool,
     extract_code: bool,
     client: &dyn Client,
     abort_signal: AbortSignal,
-) -> Result<(String, Vec<ToolResult>)> {
-    let ret = abortable_run_with_spinner(
-        client.chat_completions(input.clone()),
-        "Generating",
-        abort_signal,
-    )
-    .await;
+) -> Result<String> {
+    let gconfig = client.global_config();
+    let mcp_manager = gconfig.read().mcp_manager.clone();
 
-    match ret {
-        Ok(ret) => {
-            let ChatCompletionsOutput {
-                mut text,
-                tool_calls,
-                ..
-            } = ret;
-            if !text.is_empty() {
-                if extract_code {
-                    text = extract_code_block(&strip_think_tag(&text)).to_string();
+    let has_mcp_tools = mcp_manager
+        .as_ref()
+        .is_some_and(|m| !m.list_tools().is_empty());
+
+    if !has_mcp_tools || gconfig.read().dry_run {
+        let ret = abortable_run_with_spinner(
+            client.chat_completions(input.clone()),
+            "Generating",
+            abort_signal,
+        )
+        .await;
+
+        return match ret {
+            Ok(ret) => {
+                let ChatCompletionsOutput { mut text, .. } = ret;
+                if !text.is_empty() {
+                    if extract_code {
+                        text = extract_code_block(&strip_think_tag(&text)).to_string();
+                    }
+                    if print {
+                        gconfig.read().print_markdown(&text)?;
+                    }
                 }
-                if print {
-                    client.global_config().read().print_markdown(&text)?;
-                }
+                Ok(text)
             }
-            Ok((text, eval_tool_calls(client.global_config(), tool_calls)?))
-        }
-        Err(err) => Err(err),
+            Err(err) => Err(err),
+        };
     }
+
+    let mcp_manager = mcp_manager.unwrap();
+    let tools = mcp_manager.list_tool_definitions_openai();
+    let max_calls = gconfig.read().max_tool_calls.unwrap_or(25);
+
+    if gconfig.read().dry_run {
+        let content = input.echo_messages();
+        return Ok(content);
+    }
+
+    let http_client = client.build_client()?;
+    let mut data = {
+        let mut d = input.prepare_completion_data(client.model(), false)?;
+        d.tools = Some(tools);
+        d
+    };
+    let mut accumulated_text = String::new();
+
+    for round in 0..max_calls {
+        let output = abortable_run_with_spinner(
+            client.chat_completions_inner(&http_client, data.clone()),
+            if round == 0 { "Generating" } else { "Calling tools" },
+            abort_signal.clone(),
+        )
+        .await?;
+
+        if let Some(tool_calls) = output.tool_calls {
+            if tool_calls.is_empty() {
+                if !output.text.is_empty() {
+                    accumulated_text = output.text;
+                }
+                break;
+            }
+
+            accumulated_text.push_str(&output.text);
+
+            let mut tool_messages: Vec<Message> = Vec::new();
+            for tc in &tool_calls {
+                let args_value: serde_json::Value =
+                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                let result = mcp_manager.call_tool(&tc.function.name, args_value).await;
+                let (content, display) = match &result {
+                    Ok(text) => {
+                        let s = text.trim();
+                        let truncated = if s.len() > 500 {
+                            format!("{}...", &s[..500])
+                        } else {
+                            s.to_string()
+                        };
+                        (text.clone(), truncated)
+                    }
+                    Err(e) => (format!("Error: {e}"), format!("Error: {e}")),
+                };
+                println!("--- {}: {} ---", tc.function.name, format_tool_args(&tc.function.arguments));
+                println!("{display}");
+                println!("--- end tool call ---");
+                tool_messages.push(Message {
+                    role: MessageRole::Tool,
+                    content: MessageContent::Text(content),
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_calls: None,
+                });
+            }
+
+            let assistant_msg = Message {
+                role: MessageRole::Assistant,
+                content: if output.text.is_empty() {
+                    MessageContent::Text(String::new())
+                } else {
+                    MessageContent::Text(output.text.clone())
+                },
+                tool_call_id: None,
+                tool_calls: Some(tool_calls.clone()),
+            };
+
+            data.messages.push(assistant_msg);
+            data.messages.extend(tool_messages);
+            data.tools = Some(mcp_manager.list_tool_definitions_openai());
+            continue;
+        }
+
+        if !output.text.is_empty() {
+            accumulated_text = output.text;
+        }
+        break;
+    }
+
+    if accumulated_text.is_empty() && !print {
+        return Ok(String::new());
+    }
+
+    accumulated_text = strip_tool_call_tag(&accumulated_text).to_string();
+    if extract_code {
+        accumulated_text = extract_code_block(&strip_think_tag(&accumulated_text)).to_string();
+    }
+    if print {
+        gconfig.read().print_markdown(&accumulated_text)?;
+    }
+    Ok(accumulated_text)
 }
 
 pub async fn call_chat_completions_streaming(
     input: &Input,
     client: &dyn Client,
     abort_signal: AbortSignal,
-) -> Result<(String, Vec<ToolResult>)> {
-    let (tx, rx) = unbounded_channel();
-    let mut handler = SseHandler::new(tx, abort_signal.clone());
-
-    let (send_ret, render_ret) = tokio::join!(
-        client.chat_completions_streaming(input, &mut handler),
-        render_stream(rx, client.global_config(), abort_signal.clone()),
-    );
-
-    if handler.abort().aborted() {
-        bail!("Aborted.");
+) -> Result<String> {
+    if client.global_config().read().dry_run {
+        let content = input.echo_messages();
+        return Ok(content);
     }
 
-    render_ret?;
+    let gconfig = client.global_config();
+    let mcp_manager = gconfig.read().mcp_manager.clone();
+    let has_mcp_tools = mcp_manager
+        .as_ref()
+        .is_some_and(|m| !m.list_tools().is_empty());
 
-    let (text, tool_calls) = handler.take();
-    match send_ret {
-        Ok(_) => {
-            if !text.is_empty() && !text.ends_with('\n') {
-                println!();
-            }
-            Ok((text, eval_tool_calls(client.global_config(), tool_calls)?))
+    let http_client = client.build_client()?;
+    let mut data = {
+        let mut d = input.prepare_completion_data(client.model(), true)?;
+        if has_mcp_tools {
+            d.tools = Some(mcp_manager.as_ref().unwrap().list_tool_definitions_openai());
         }
-        Err(err) => {
-            if !text.is_empty() {
-                println!();
+        d
+    };
+
+    let max_calls = if has_mcp_tools {
+        gconfig.read().max_tool_calls.unwrap_or(25)
+    } else {
+        1
+    };
+
+    let mcp_manager = mcp_manager.unwrap_or_else(|| std::sync::Arc::new(crate::mcp::McpManager::empty()));
+    let mut accumulated_text = String::new();
+
+    for _round in 0..max_calls {
+        let (tx, rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, abort_signal.clone());
+
+        let (send_ret, render_ret) = tokio::join!(
+            async {
+                let ret = client
+                    .chat_completions_streaming_inner(&http_client, &mut handler, data.clone())
+                    .await;
+                handler.done();
+                ret
+            },
+            render_stream(rx, client.global_config(), abort_signal.clone()),
+        );
+
+        if handler.abort().aborted() {
+            bail!("Aborted.");
+        }
+
+        render_ret?;
+
+        let round_text = handler.buffer().to_string();
+        let tool_calls = handler.take_tool_calls();
+        let _ = handler.take();
+
+        match send_ret {
+            Ok(()) => {
+                if let Some(tc) = tool_calls {
+                    if tc.is_empty() {
+                        accumulated_text.push_str(&round_text);
+                        break;
+                    }
+
+                    accumulated_text.push_str(&round_text);
+
+                    let mut tool_messages: Vec<Message> = Vec::new();
+                    for tcall in &tc {
+                        let args_value: serde_json::Value =
+                            serde_json::from_str(&tcall.function.arguments).unwrap_or_default();
+                        let result = mcp_manager.call_tool(&tcall.function.name, args_value).await;
+                        let (content, display) = match &result {
+                            Ok(text) => {
+                                let s = text.trim();
+                                let truncated = if s.len() > 500 {
+                                    format!("{}...", &s[..500])
+                                } else {
+                                    s.to_string()
+                                };
+                                (text.clone(), truncated)
+                            }
+                            Err(e) => (format!("Error: {e}"), format!("Error: {e}")),
+                        };
+                        println!("--- {}: {} ---", tcall.function.name, format_tool_args(&tcall.function.arguments));
+                        println!("{display}");
+                        println!("--- end tool call ---");
+                        tool_messages.push(Message {
+                            role: MessageRole::Tool,
+                            content: MessageContent::Text(content),
+                            tool_call_id: Some(tcall.id.clone()),
+                            tool_calls: None,
+                        });
+                    }
+
+                    let assistant_msg = Message {
+                        role: MessageRole::Assistant,
+                        content: if round_text.is_empty() {
+                            MessageContent::Text(String::new())
+                        } else {
+                            MessageContent::Text(round_text.clone())
+                        },
+                        tool_call_id: None,
+                        tool_calls: Some(tc),
+                    };
+
+                    data.messages.push(assistant_msg);
+                    data.messages.extend(tool_messages);
+                    data.tools = Some(mcp_manager.list_tool_definitions_openai());
+                    continue;
+                }
+
+                accumulated_text.push_str(&round_text);
+                accumulated_text = strip_tool_call_tag(&accumulated_text).to_string();
+                if !accumulated_text.is_empty() && !accumulated_text.ends_with('\n') {
+                    println!();
+                }
+                return Ok(accumulated_text);
             }
-            Err(err)
+            Err(err) => {
+                if !accumulated_text.is_empty() || !round_text.is_empty() {
+                    println!();
+                }
+                return Err(err);
+            }
         }
     }
+
+    accumulated_text = strip_tool_call_tag(&accumulated_text).to_string();
+    if !accumulated_text.is_empty() && !accumulated_text.ends_with('\n') {
+        println!();
+    }
+    Ok(accumulated_text)
 }
 
 pub fn noop_prepare_embeddings<T>(_client: &T, _data: &EmbeddingsData) -> Result<RequestData> {
