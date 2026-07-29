@@ -730,6 +730,16 @@ async fn ask(
     if input.is_empty() {
         return Ok(());
     }
+    {
+        let mut cfg = config.write();
+        if cfg.session.is_none() {
+            cfg.use_session(None)?;
+            if let Some(session) = cfg.session.as_mut() {
+                session.set_save_session(Some(false));
+            }
+        }
+    }
+    input.set_with_session();
     if with_embeddings {
         input.use_embeddings(abort_signal.clone()).await?;
     }

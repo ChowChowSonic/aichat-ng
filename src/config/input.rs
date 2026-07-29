@@ -175,6 +175,10 @@ impl Input {
         self.regenerate
     }
 
+    pub fn set_with_session(&mut self) {
+        self.with_session = true;
+    }
+
     pub fn set_regenerate(&mut self) {
         let role = self.config.read().extract_role();
         if role.name() == self.role().name() {

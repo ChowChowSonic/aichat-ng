@@ -90,7 +90,7 @@ __INPUT__
 </user_query>"#;
 
 const LEFT_PROMPT: &str = "{color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} ";
-const RIGHT_PROMPT: &str = "{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}";
+const RIGHT_PROMPT: &str = "{color.purple}{?consume_tokens {consume_tokens}({consume_percent}%)}{color.reset}";
 
 static EDITOR: OnceLock<Option<String>> = OnceLock::new();
 
@@ -1857,11 +1857,13 @@ impl Config {
             output.insert("role", role.name().to_string());
         }
         if let Some(session) = &self.session {
-            output.insert("session", session.name().to_string());
-            if let Some(autoname) = session.autoname() {
-                output.insert("session_autoname", autoname.to_string());
+            if session.save_session() != Some(false) {
+                output.insert("session", session.name().to_string());
+                if let Some(autoname) = session.autoname() {
+                    output.insert("session_autoname", autoname.to_string());
+                }
+                output.insert("dirty", session.dirty().to_string());
             }
-            output.insert("dirty", session.dirty().to_string());
             let (tokens, percent) = session.tokens_usage();
             output.insert("consume_tokens", tokens.to_string());
             output.insert("consume_percent", percent.to_string());
