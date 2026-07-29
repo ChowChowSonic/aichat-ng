@@ -12,7 +12,7 @@ use self::session::Session;
 
 use crate::client::{
     create_client_config, list_client_types, list_models, ClientConfig,
-    Model, ModelType, ProviderModels, OPENAI_COMPATIBLE_PROVIDERS,
+    Message, Model, ModelType, ProviderModels, OPENAI_COMPATIBLE_PROVIDERS,
 };
 use crate::mcp::McpManager;
 use crate::mcp::McpServerConfig;
@@ -170,6 +170,9 @@ pub struct Config {
 
     #[serde(skip)]
     pub mcp_manager: Option<Arc<McpManager>>,
+
+    #[serde(skip)]
+    pub pending_tool_messages: Option<Vec<Message>>,
 }
 
 impl Default for Config {
@@ -234,6 +237,8 @@ impl Default for Config {
             agent: None,
 
             mcp_manager: None,
+
+            pending_tool_messages: None,
         }
     }
 }
@@ -1071,7 +1076,7 @@ impl Config {
                         .with_default(false)
                         .prompt()?;
                         if ans {
-                            session.add_message(input, output)?;
+                            session.add_message(input, output, Vec::new())?;
                         }
                     }
                 }
@@ -1811,7 +1816,7 @@ impl Config {
             let mut markdown_render = MarkdownRender::init(render_options)?;
             println!("{}", markdown_render.render(text));
         } else {
-            println!("{text}");
+            println!("{}", text.replace("<think>", "").replace("</think>", ""));
         }
         Ok(())
     }
@@ -1928,7 +1933,8 @@ impl Config {
         let mut input = input.clone();
         input.clear_patch();
         if let Some(session) = input.session_mut(&mut self.session) {
-            session.add_message(&input, output)?;
+            let tool_msgs = self.pending_tool_messages.take().unwrap_or_default();
+            session.add_message(&input, output, tool_msgs)?;
             return Ok(());
         }
 

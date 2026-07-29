@@ -455,7 +455,7 @@ impl Session {
         Ok(())
     }
 
-    pub fn add_message(&mut self, input: &Input, output: &str) -> Result<()> {
+    pub fn add_message(&mut self, input: &Input, output: &str, tool_call_messages: Vec<Message>) -> Result<()> {
         if input.continue_output().is_some() {
             if let Some(message) = self.messages.last_mut() {
                 if let MessageContent::Text(text) = &mut message.content {
@@ -481,6 +481,7 @@ impl Session {
                     .push(Message::new(MessageRole::User, input.message_content()));
             }
             self.data_urls.extend(input.data_urls());
+            self.messages.extend(tool_call_messages);
             self.messages.push(Message::new(
                 MessageRole::Assistant,
                 MessageContent::Text(output.to_string()),

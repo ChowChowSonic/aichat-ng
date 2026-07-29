@@ -49,6 +49,7 @@ pub async fn raw_stream(
 
             match evt {
                 SseEvent::Text(text) => {
+                    let text = text.replace("<think>", "").replace("</think>", "");
                     print!("{text}");
                     stdout().flush()?;
                 }

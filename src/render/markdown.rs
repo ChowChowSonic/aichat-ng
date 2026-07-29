@@ -28,6 +28,7 @@ pub struct MarkdownRender {
     code_syntax: Option<SyntaxReference>,
     prev_line_type: LineType,
     wrap_width: Option<u16>,
+    thinking: bool,
 }
 
 impl MarkdownRender {
@@ -65,6 +66,7 @@ impl MarkdownRender {
             prev_line_type: line_type,
             wrap_width,
             options,
+            thinking: false,
         })
     }
 
@@ -75,10 +77,12 @@ impl MarkdownRender {
             .join("\n")
     }
 
-    pub fn render_line(&self, line: &str) -> String {
+    pub fn render_line(&mut self, line: &str) -> String {
         let (_, code_syntax, is_code) = self.check_line(line);
         if is_code {
             self.highlight_code_line(line, &code_syntax)
+        } else if self.thinking || line.contains("<think>") || line.contains("</think>") {
+            self.render_think_line_mut(line)
         } else {
             self.highlight_line(line, &self.md_syntax, false)
         }
@@ -88,12 +92,66 @@ impl MarkdownRender {
         let (line_type, code_syntax, is_code) = self.check_line(line);
         let output = if is_code {
             self.highlight_code_line(line, &code_syntax)
+        } else if self.thinking || line.contains("<think>") || line.contains("</think>") {
+            self.render_think_line_mut(line)
         } else {
             self.highlight_line(line, &self.md_syntax, false)
         };
         self.prev_line_type = line_type;
         self.code_syntax = code_syntax;
         output
+    }
+
+    fn render_think_line_mut(&mut self, line: &str) -> String {
+        let mut output = String::new();
+        let mut pos = 0;
+
+        while pos < line.len() {
+            let remaining = &line[pos..];
+
+            if self.thinking {
+                if let Some(end) = remaining.find("</think>") {
+                    output.push_str(&self.style_think_text(&remaining[..end]));
+                    pos += end + "</think>".len();
+                    self.thinking = false;
+                } else {
+                    output.push_str(&self.style_think_text(remaining));
+                    break;
+                }
+            } else {
+                if let Some(start) = remaining.find("<think>") {
+                    if start > 0 {
+                        output.push_str(&self.highlight_line(&remaining[..start], &self.md_syntax, false));
+                    }
+                    pos += start + "<think>".len();
+                    self.thinking = true;
+                } else if let Some(end) = remaining.find("</think>") {
+                    if end > 0 {
+                        output.push_str(&self.highlight_line(&remaining[..end], &self.md_syntax, false));
+                    }
+                    pos += end + "</think>".len();
+                } else {
+                    output.push_str(&self.highlight_line(remaining, &self.md_syntax, false));
+                    break;
+                }
+            }
+        }
+
+        output
+    }
+
+    fn style_think_text(&self, text: &str) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        let styled = if let Some(theme) = &self.options.theme {
+            let fg = theme.settings.foreground.unwrap_or(SyntectColor::WHITE);
+            let color = convert_color(fg, self.options.truecolor);
+            text.with(color).dim().italic().to_string()
+        } else {
+            text.dim().italic().to_string()
+        };
+        self.wrap_line(styled, false)
     }
 
     fn check_line(&self, line: &str) -> (LineType, Option<SyntaxReference>, bool) {

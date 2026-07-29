@@ -510,12 +510,17 @@ pub async fn call_chat_completions(
         d.tools = Some(tools);
         d
     };
+    let mut accumulated_tool_interactions: Vec<Message> = Vec::new();
     let mut accumulated_text = String::new();
 
     for round in 0..max_calls {
         let output = abortable_run_with_spinner(
             client.chat_completions_inner(&http_client, data.clone()),
-            if round == 0 { "Generating" } else { "Calling tools" },
+            if round == 0 {
+                "Generating"
+            } else {
+                "Calling tools"
+            },
             abort_signal.clone(),
         )
         .await?;
@@ -527,8 +532,6 @@ pub async fn call_chat_completions(
                 }
                 break;
             }
-
-            accumulated_text.push_str(&output.text);
 
             let mut tool_messages: Vec<Message> = Vec::new();
             for tc in &tool_calls {
@@ -547,9 +550,13 @@ pub async fn call_chat_completions(
                     }
                     Err(e) => (format!("Error: {e}"), format!("Error: {e}")),
                 };
-                println!("--- {}: {} ---", tc.function.name, format_tool_args(&tc.function.arguments));
+                println!(
+                    "\n\n--- {}: {} ---",
+                    tc.function.name,
+                    format_tool_args(&tc.function.arguments)
+                );
                 println!("{display}");
-                println!("--- end tool call ---");
+                println!("--- end tool call ---\n");
                 tool_messages.push(Message {
                     role: MessageRole::Tool,
                     content: MessageContent::Text(content),
@@ -569,6 +576,9 @@ pub async fn call_chat_completions(
                 tool_calls: Some(tool_calls.clone()),
             };
 
+            accumulated_tool_interactions.push(assistant_msg.clone());
+            accumulated_tool_interactions.extend(tool_messages.clone());
+
             data.messages.push(assistant_msg);
             data.messages.extend(tool_messages);
             data.tools = Some(mcp_manager.list_tool_definitions_openai());
@@ -579,6 +589,10 @@ pub async fn call_chat_completions(
             accumulated_text = output.text;
         }
         break;
+    }
+
+    if !accumulated_tool_interactions.is_empty() {
+        client.global_config().write().pending_tool_messages = Some(accumulated_tool_interactions);
     }
 
     if accumulated_text.is_empty() && !print {
@@ -626,7 +640,9 @@ pub async fn call_chat_completions_streaming(
         1
     };
 
-    let mcp_manager = mcp_manager.unwrap_or_else(|| std::sync::Arc::new(crate::mcp::McpManager::empty()));
+    let mcp_manager =
+        mcp_manager.unwrap_or_else(|| std::sync::Arc::new(crate::mcp::McpManager::empty()));
+    let mut accumulated_tool_interactions: Vec<Message> = Vec::new();
     let mut accumulated_text = String::new();
 
     for _round in 0..max_calls {
@@ -662,13 +678,13 @@ pub async fn call_chat_completions_streaming(
                         break;
                     }
 
-                    accumulated_text.push_str(&round_text);
-
                     let mut tool_messages: Vec<Message> = Vec::new();
                     for tcall in &tc {
                         let args_value: serde_json::Value =
                             serde_json::from_str(&tcall.function.arguments).unwrap_or_default();
-                        let result = mcp_manager.call_tool(&tcall.function.name, args_value).await;
+                        let result = mcp_manager
+                            .call_tool(&tcall.function.name, args_value)
+                            .await;
                         let (content, display) = match &result {
                             Ok(text) => {
                                 let s = text.trim();
@@ -681,9 +697,13 @@ pub async fn call_chat_completions_streaming(
                             }
                             Err(e) => (format!("Error: {e}"), format!("Error: {e}")),
                         };
-                        println!("--- {}: {} ---", tcall.function.name, format_tool_args(&tcall.function.arguments));
+                        println!(
+                            "\n\n--- {}: {} ---",
+                            tcall.function.name,
+                            format_tool_args(&tcall.function.arguments)
+                        );
                         println!("{display}");
-                        println!("--- end tool call ---");
+                        println!("--- end tool call ---\n");
                         tool_messages.push(Message {
                             role: MessageRole::Tool,
                             content: MessageContent::Text(content),
@@ -703,6 +723,9 @@ pub async fn call_chat_completions_streaming(
                         tool_calls: Some(tc),
                     };
 
+                    accumulated_tool_interactions.push(assistant_msg.clone());
+                    accumulated_tool_interactions.extend(tool_messages.clone());
+
                     data.messages.push(assistant_msg);
                     data.messages.extend(tool_messages);
                     data.tools = Some(mcp_manager.list_tool_definitions_openai());
@@ -710,6 +733,10 @@ pub async fn call_chat_completions_streaming(
                 }
 
                 accumulated_text.push_str(&round_text);
+                if !accumulated_tool_interactions.is_empty() {
+                    client.global_config().write().pending_tool_messages =
+                        Some(accumulated_tool_interactions);
+                }
                 accumulated_text = strip_tool_call_tag(&accumulated_text).to_string();
                 if !accumulated_text.is_empty() && !accumulated_text.ends_with('\n') {
                     println!();
@@ -717,6 +744,10 @@ pub async fn call_chat_completions_streaming(
                 return Ok(accumulated_text);
             }
             Err(err) => {
+                if !accumulated_tool_interactions.is_empty() {
+                    client.global_config().write().pending_tool_messages =
+                        Some(accumulated_tool_interactions);
+                }
                 if !accumulated_text.is_empty() || !round_text.is_empty() {
                     println!();
                 }
@@ -725,6 +756,9 @@ pub async fn call_chat_completions_streaming(
         }
     }
 
+    if !accumulated_tool_interactions.is_empty() {
+        client.global_config().write().pending_tool_messages = Some(accumulated_tool_interactions);
+    }
     accumulated_text = strip_tool_call_tag(&accumulated_text).to_string();
     if !accumulated_text.is_empty() && !accumulated_text.ends_with('\n') {
         println!();

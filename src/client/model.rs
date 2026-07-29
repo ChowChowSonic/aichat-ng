@@ -207,7 +207,7 @@ impl Model {
     }
 
     pub fn max_tokens_param(&self) -> Option<isize> {
-        if self.data.require_max_tokens {
+        if self.data.require_max_tokens || self.data.max_output_tokens.is_some() {
             self.data.max_output_tokens
         } else {
             None

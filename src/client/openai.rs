@@ -123,15 +123,16 @@ pub async fn openai_chat_completions_streaming(
         let choice = &data["choices"][0];
         let delta = &choice["delta"];
 
-        if let Some(text) = delta["content"]
+        if let Some(raw_text) = delta["content"]
             .as_str()
             .filter(|v| !v.is_empty())
         {
+            let text = strip_tool_call_tag(raw_text);
             if reasoning_state == 1 {
                 handler.text("\n</think>\n\n")?;
                 reasoning_state = 0;
             }
-            handler.text(text)?;
+            handler.text(&text)?;
         } else if let Some(text) = delta["reasoning_content"]
             .as_str()
             .or_else(|| delta["reasoning"].as_str())
@@ -245,10 +246,15 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
             let content_val = match &content {
                 MessageContent::Text(text) if role.is_assistant() => {
                     let text = strip_tool_call_tag(text);
-                    if i != messages_len - 1 {
-                        Value::String(strip_think_tag(&text).to_string())
+                    let text = if i != messages_len - 1 {
+                        strip_think_tag(&text).to_string()
                     } else {
-                        Value::String(text.to_string())
+                        text.to_string()
+                    };
+                    if text.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(text)
                     }
                 }
                 _ => json!(&content),
@@ -268,7 +274,9 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                 }
             }
             if obj["content"] == Value::Null {
-                obj["content"] = Value::String(String::new());
+                if obj.get("tool_calls").map_or(true, |v| v.is_null()) {
+                    obj["content"] = Value::String(String::new());
+                }
             }
             obj
         })
