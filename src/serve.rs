@@ -319,6 +319,7 @@ impl Server {
                 let is_first = Arc::new(std::sync::atomic::AtomicBool::new(true));
                 let (sse_tx, sse_rx) = unbounded_channel();
                 let mut handler = SseHandler::new(sse_tx, abort_signal);
+                handler.set_no_think(client.global_config().read().no_think);
                 async fn map_event(
                     mut sse_rx: UnboundedReceiver<SseEvent>,
                     tx: &UnboundedSender<ResEvent>,

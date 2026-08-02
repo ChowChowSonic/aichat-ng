@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 pub static RE_VARIABLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{(\w+)\}\}").unwrap());
 pub fn interpolate_variables(text: &mut String) {
     *text = RE_VARIABLE
-        .replace_all(text, |caps: &Captures<'_>| {
+        .replace_all(text, |caps: &Captures<'_, str>| {
             let key = &caps[1];
             match key {
                 "__os__" => env::consts::OS.to_string(),

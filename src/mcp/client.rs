@@ -2,7 +2,7 @@ use crate::mcp::config::{McpServerConfig, McpTransport};
 use crate::mcp::manager::McpTool;
 
 use anyhow::{Context, Result};
-use rmcp::model::{CallToolRequestParams, RawContent, Tool};
+use rmcp::model::{CallToolRequestParams, ContentBlock, Tool};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use std::sync::Arc;
@@ -117,9 +117,9 @@ impl McpClient {
         let output = result
             .content
             .into_iter()
-            .map(|c| match &*c {
-                RawContent::Text(t) => t.text.clone(),
-                RawContent::Resource(r) => match &r.resource {
+            .map(|c| match c {
+                ContentBlock::Text(t) => t.text.clone(),
+                ContentBlock::Resource(r) => match &r.resource {
                     rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
                         text.clone()
                     }

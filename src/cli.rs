@@ -54,6 +54,9 @@ pub struct Cli {
     /// Turn off stream mode
     #[clap(short = 'S', long)]
     pub no_stream: bool,
+    /// Turn off thinking process
+    #[clap(long)]
+    pub no_think: bool,
     /// Display the message without sending it
     #[clap(long)]
     pub dry_run: bool,

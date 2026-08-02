@@ -1,11 +1,12 @@
 use super::{catch_error, ToolCall};
-use crate::utils::AbortSignal;
+use crate::utils::{filter_think_blocks, AbortSignal};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{Stream, StreamExt};
 use reqwest::RequestBuilder;
 use reqwest_eventsource::{Error as EventSourceError, Event, RequestBuilderExt};
 use serde_json::Value;
+use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 
 pub struct SseHandler {
@@ -13,6 +14,10 @@ pub struct SseHandler {
     abort_signal: AbortSignal,
     buffer: String,
     tool_calls: Option<Vec<ToolCall>>,
+    usage: Option<(u64, u64)>,
+    no_think: bool,
+    in_think_block: bool,
+    first_token_at: Option<Instant>,
 }
 
 impl SseHandler {
@@ -22,14 +27,33 @@ impl SseHandler {
             abort_signal,
             buffer: String::new(),
             tool_calls: None,
+            usage: None,
+            no_think: false,
+            in_think_block: false,
+            first_token_at: None,
         }
+    }
+
+    pub fn set_no_think(&mut self, no_think: bool) {
+        self.no_think = no_think;
     }
 
     pub fn text(&mut self, text: &str) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
-        self.buffer.push_str(text);
+        let text = if self.no_think {
+            let (visible, in_block) = filter_think_blocks(text, self.in_think_block);
+            self.in_think_block = in_block;
+            visible
+        } else {
+            text.to_string()
+        };
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.first_token_at.get_or_insert_with(Instant::now);
+        self.buffer.push_str(&text);
         let ret = self
             .sender
             .send(SseEvent::Text(text.to_string()))
@@ -63,6 +87,18 @@ impl SseHandler {
 
     pub fn take_tool_calls(&mut self) -> Option<Vec<ToolCall>> {
         self.tool_calls.take()
+    }
+
+    pub fn set_usage(&mut self, input_tokens: u64, output_tokens: u64) {
+        self.usage = Some((input_tokens, output_tokens));
+    }
+
+    pub fn take_usage(&mut self) -> Option<(u64, u64)> {
+        self.usage.take()
+    }
+
+    pub fn first_token_at(&self) -> Option<Instant> {
+        self.first_token_at
     }
 
     pub fn buffer(&self) -> &str {
@@ -241,7 +277,7 @@ mod tests {
 
     use bytes::Bytes;
     use futures_util::stream;
-    use rand::Rng;
+    use rand::RngExt;
 
     fn split_chunks(text: &str) -> Vec<Vec<u8>> {
         let mut rng = rand::rng();

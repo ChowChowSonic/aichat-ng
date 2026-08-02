@@ -94,6 +94,41 @@ pub fn strip_think_tag(text: &str) -> Cow<'_, str> {
     THINK_TAG_RE.replace_all(text, "")
 }
 
+pub fn strip_think_blocks(text: &str) -> String {
+    filter_think_blocks(text, false).0
+}
+
+/// Remove `<think>...</think>` spans from a text chunk, tracking state across chunks.
+/// Returns the visible text and whether the caller is currently inside a think block.
+pub fn filter_think_blocks(text: &str, mut in_block: bool) -> (String, bool) {
+    let mut out = String::new();
+    let mut rest = text;
+    loop {
+        if in_block {
+            match rest.find("</think>") {
+                Some(pos) => {
+                    rest = &rest[pos + "</think>".len()..];
+                    in_block = false;
+                }
+                None => break,
+            }
+        } else {
+            match rest.find("<think>") {
+                Some(pos) => {
+                    out.push_str(&rest[..pos]);
+                    rest = &rest[pos + "<think>".len()..];
+                    in_block = true;
+                }
+                None => {
+                    out.push_str(rest);
+                    break;
+                }
+            }
+        }
+    }
+    (out, in_block)
+}
+
 pub fn strip_tool_call_tag(text: &str) -> Cow<'_, str> {
     TOOL_CALL_TAG_RE.replace_all(text, "")
 }

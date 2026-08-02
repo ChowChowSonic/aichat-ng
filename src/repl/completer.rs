@@ -116,11 +116,13 @@ fn create_suggestion(value: &str, description: &str, span: Span) -> Suggestion {
     };
     Suggestion {
         value: value.to_string(),
+        display_override: None,
         description,
         style: None,
         extra: None,
         span,
         append_whitespace: false,
+        match_indices: None,
     }
 }
 

@@ -40,7 +40,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use syntect::highlighting::ThemeSet;
-use terminal_colorsaurus::{color_scheme, ColorScheme, QueryOptions};
+use terminal_colorsaurus::{theme_mode, QueryOptions, ThemeMode};
 
 pub const TEMP_ROLE_NAME: &str = "%%";
 pub const TEMP_RAG_NAME: &str = "temp";
@@ -105,6 +105,7 @@ pub struct Config {
 
     pub dry_run: bool,
     pub stream: bool,
+    pub no_think: bool,
     pub save: bool,
     pub keybindings: String,
     pub editor: Option<String>,
@@ -184,6 +185,7 @@ impl Default for Config {
 
             dry_run: false,
             stream: true,
+            no_think: false,
             save: false,
             keybindings: "emacs".into(),
             editor: None,
@@ -580,6 +582,7 @@ impl Config {
             ("rag_top_k", rag_top_k.to_string()),
             ("dry_run", self.dry_run.to_string()),
             ("stream", self.stream.to_string()),
+            ("no_think", self.no_think.to_string()),
             ("save", self.save.to_string()),
             ("keybindings", self.keybindings.clone()),
             ("wrap", wrap),
@@ -648,6 +651,10 @@ impl Config {
             "stream" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
                 config.write().stream = value;
+            }
+            "no_think" => {
+                let value = value.parse().with_context(|| "Invalid value")?;
+                config.write().no_think = value;
             }
             "save" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
@@ -1666,6 +1673,7 @@ impl Config {
                         "max_output_tokens",
                         "dry_run",
                         "stream",
+                        "no_think",
                         "save",
                         "highlight",
                     ];
@@ -1688,6 +1696,7 @@ impl Config {
                 },
                 "dry_run" => complete_bool(self.dry_run),
                 "stream" => complete_bool(self.stream),
+                "no_think" => complete_bool(self.no_think),
                 "save" => complete_bool(self.save),
                 "save_session" => {
                     let save_session = if let Some(session) = &self.session {
@@ -1811,10 +1820,15 @@ impl Config {
     }
 
     pub fn print_markdown(&self, text: &str) -> Result<()> {
+        let text = if self.no_think {
+            strip_think_blocks(text)
+        } else {
+            text.to_string()
+        };
         if *IS_STDOUT_TERMINAL {
             let render_options = self.render_options()?;
             let mut markdown_render = MarkdownRender::init(render_options)?;
-            println!("{}", markdown_render.render(text));
+            println!("{}", markdown_render.render(&text));
         } else {
             println!("{}", text.replace("<think>", "").replace("</think>", ""));
         }
@@ -2096,6 +2110,9 @@ impl Config {
         if let Some(Some(v)) = read_env_bool(&get_env_name("stream")) {
             self.stream = v;
         }
+        if let Some(Some(v)) = read_env_bool(&get_env_name("no_think")) {
+            self.no_think = v;
+        }
         if let Some(Some(v)) = read_env_bool(&get_env_name("save")) {
             self.save = v;
         }
@@ -2172,10 +2189,10 @@ impl Config {
             if let Some(v) = read_env_value::<String>(&get_env_name("theme")) {
                 self.theme = v;
             } else if *IS_STDOUT_TERMINAL {
-                if let Ok(color_scheme) = color_scheme(QueryOptions::default()) {
-                    let theme = match color_scheme {
-                        ColorScheme::Dark => "dark",
-                        ColorScheme::Light => "light",
+                if let Ok(mode) = theme_mode(QueryOptions::default()) {
+                    let theme = match mode {
+                        ThemeMode::Dark => "dark",
+                        ThemeMode::Light => "light",
                     };
                     self.theme = Some(theme.into());
                 }

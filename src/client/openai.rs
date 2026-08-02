@@ -120,6 +120,10 @@ pub async fn openai_chat_completions_streaming(
         }
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
+        if let Some(prompt_tokens) = data["usage"]["prompt_tokens"].as_u64() {
+            let completion_tokens = data["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+            handler.set_usage(prompt_tokens, completion_tokens);
+        }
         let choice = &data["choices"][0];
         let delta = &choice["delta"];
 
@@ -312,6 +316,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
     }
     if stream {
         body["stream"] = true.into();
+        body["stream_options"] = json!({ "include_usage": true });
     }
     body
 }

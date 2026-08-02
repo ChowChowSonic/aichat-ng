@@ -16,7 +16,7 @@ use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::unbounded_channel;
 
 const MODELS_YAML: &str = include_str!("../../models.yaml");
@@ -82,6 +82,7 @@ pub trait Client: Sync + Send {
         handler: &mut SseHandler,
     ) -> Result<()> {
         let abort_signal = handler.abort();
+        handler.set_no_think(self.global_config().read().no_think);
         let input = input.clone();
         tokio::select! {
             ret = async {
@@ -374,6 +375,23 @@ pub struct RerankResult {
 
 pub type PromptAction<'a> = (&'a str, &'a str, Option<&'a str>);
 
+pub fn print_generation_info(start: Instant, input_tokens: Option<u64>, output_tokens: Option<u64>) {
+    if !*IS_STDOUT_TERMINAL {
+        return;
+    }
+    let elapsed = start.elapsed().as_secs_f32();
+    let mut text = format!("{elapsed:.1}s");
+    if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
+        let speed = if elapsed > 0.0 {
+            (output as f32 / elapsed).round() as u64
+        } else {
+            0
+        };
+        text = format!("{text} · {input}→{output} tok · {speed} tok/s");
+    }
+    println!("{}", dimmed_text(&text));
+}
+
 pub async fn create_config(
     prompts: &[PromptAction<'static>],
     client: &str,
@@ -465,6 +483,7 @@ pub async fn call_chat_completions(
 ) -> Result<String> {
     let gconfig = client.global_config();
     let mcp_manager = gconfig.read().mcp_manager.clone();
+    let start = Instant::now();
 
     let has_mcp_tools = mcp_manager
         .as_ref()
@@ -480,8 +499,16 @@ pub async fn call_chat_completions(
 
         return match ret {
             Ok(ret) => {
-                let ChatCompletionsOutput { mut text, .. } = ret;
+                let ChatCompletionsOutput {
+                    mut text,
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } = ret;
                 if !text.is_empty() {
+                    if gconfig.read().no_think {
+                        text = strip_think_blocks(&text);
+                    }
                     if extract_code {
                         text = extract_code_block(&strip_think_tag(&text)).to_string();
                     }
@@ -489,6 +516,7 @@ pub async fn call_chat_completions(
                         gconfig.read().print_markdown(&text)?;
                     }
                 }
+                print_generation_info(start, input_tokens, output_tokens);
                 Ok(text)
             }
             Err(err) => Err(err),
@@ -512,6 +540,8 @@ pub async fn call_chat_completions(
     };
     let mut accumulated_tool_interactions: Vec<Message> = Vec::new();
     let mut accumulated_text = String::new();
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
 
     for round in 0..max_calls {
         let output = abortable_run_with_spinner(
@@ -524,6 +554,9 @@ pub async fn call_chat_completions(
             abort_signal.clone(),
         )
         .await?;
+
+        input_tokens = output.input_tokens.unwrap_or(input_tokens);
+        output_tokens = output.output_tokens.unwrap_or(output_tokens);
 
         if let Some(tool_calls) = output.tool_calls {
             if tool_calls.is_empty() {
@@ -599,6 +632,9 @@ pub async fn call_chat_completions(
         return Ok(String::new());
     }
 
+    if gconfig.read().no_think {
+        accumulated_text = strip_think_blocks(&accumulated_text);
+    }
     accumulated_text = strip_tool_call_tag(&accumulated_text).to_string();
     if extract_code {
         accumulated_text = extract_code_block(&strip_think_tag(&accumulated_text)).to_string();
@@ -606,6 +642,11 @@ pub async fn call_chat_completions(
     if print {
         gconfig.read().print_markdown(&accumulated_text)?;
     }
+    print_generation_info(
+        start,
+        (input_tokens != 0).then_some(input_tokens),
+        (output_tokens != 0).then_some(output_tokens),
+    );
     Ok(accumulated_text)
 }
 
@@ -621,6 +662,8 @@ pub async fn call_chat_completions_streaming(
 
     let gconfig = client.global_config();
     let mcp_manager = gconfig.read().mcp_manager.clone();
+    let start = Instant::now();
+    let mut first_token: Option<Instant> = None;
     let has_mcp_tools = mcp_manager
         .as_ref()
         .is_some_and(|m| !m.list_tools().is_empty());
@@ -644,10 +687,13 @@ pub async fn call_chat_completions_streaming(
         mcp_manager.unwrap_or_else(|| std::sync::Arc::new(crate::mcp::McpManager::empty()));
     let mut accumulated_tool_interactions: Vec<Message> = Vec::new();
     let mut accumulated_text = String::new();
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
 
     for _round in 0..max_calls {
         let (tx, rx) = unbounded_channel();
         let mut handler = SseHandler::new(tx, abort_signal.clone());
+        handler.set_no_think(client.global_config().read().no_think);
 
         let (send_ret, render_ret) = tokio::join!(
             async {
@@ -668,6 +714,13 @@ pub async fn call_chat_completions_streaming(
 
         let round_text = handler.buffer().to_string();
         let tool_calls = handler.take_tool_calls();
+        if let Some((i, o)) = handler.take_usage() {
+            input_tokens = i;
+            output_tokens = o;
+        }
+        if first_token.is_none() {
+            first_token = handler.first_token_at();
+        }
         let _ = handler.take();
 
         match send_ret {
@@ -741,6 +794,11 @@ pub async fn call_chat_completions_streaming(
                 if !accumulated_text.is_empty() && !accumulated_text.ends_with('\n') {
                     println!();
                 }
+                print_generation_info(
+                    first_token.unwrap_or(start),
+                    (input_tokens != 0).then_some(input_tokens),
+                    (output_tokens != 0).then_some(output_tokens),
+                );
                 return Ok(accumulated_text);
             }
             Err(err) => {
@@ -763,6 +821,11 @@ pub async fn call_chat_completions_streaming(
     if !accumulated_text.is_empty() && !accumulated_text.ends_with('\n') {
         println!();
     }
+    print_generation_info(
+        first_token.unwrap_or(start),
+        (input_tokens != 0).then_some(input_tokens),
+        (output_tokens != 0).then_some(output_tokens),
+    );
     Ok(accumulated_text)
 }
 
